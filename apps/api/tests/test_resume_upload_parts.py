@@ -150,7 +150,9 @@ def test_it_reports_the_parts_held_and_the_pinned_chunk_size(
     assert body["original_filename"] == "clip.mp4"
 
 
-def test_asking_to_resume_counts_as_activity(client, auth_headers, resumable, monkeypatch):
+def test_asking_to_resume_counts_as_activity(
+    client, auth_headers, mock_db, resumable, monkeypatch
+):
     # Otherwise a resume started just inside the reaper's window races it, and the
     # reaper aborts the upload underneath the transfer it just handed out.
     version, _ = resumable
@@ -159,6 +161,58 @@ def test_asking_to_resume_counts_as_activity(client, auth_headers, resumable, mo
     client.get(_url(version), headers=auth_headers)
 
     assert version.last_activity_at is not None
+    # And written down. `get_db` never commits, so without the commit in the
+    # endpoint the timestamp lives only on this MagicMock and the reaper still
+    # sees the old one -- the assertion above passes either way.
+    mock_db.commit.assert_called_once()
+
+
+def test_the_recorded_chunk_size_decides_which_parts_are_held(
+    client, auth_headers, mock_db, test_user, monkeypatch
+):
+    """An upload pinned to something other than today's constant still resumes.
+
+    This is the whole reason the column exists: `CHUNK_SIZE_BYTES` can change
+    between the upload and the resume, and every part already in the bucket was
+    cut at the old size. Reading the constant instead of the record rejects all
+    of them as the wrong size, and the upload the pinning exists to rescue is
+    the one that cannot be resumed. The fixture elsewhere pins exactly the
+    constant, so it cannot tell the two apart.
+    """
+    pinned = 8 * MB
+    assert pinned != CHUNK_SIZE_BYTES, "the point of this test is that they differ"
+
+    version = MagicMock()
+    version.id = uuid.uuid4()
+    version.asset_id = ASSET_ID
+    version.created_by = test_user.id
+    version.processing_status = ProcessingStatus.uploading
+    version.upload_id = "upload-1"
+    version.chunk_size_bytes = pinned
+    version.last_activity_at = None
+
+    media_file = MagicMock()
+    media_file.version_id = version.id
+    media_file.s3_key_raw = "raw/p/a/v/original.mp4"
+    media_file.file_size_bytes = TOTAL
+    media_file.original_filename = "clip.mp4"
+    media_file.mime_type = "video/mp4"
+    mock_db.first.side_effect = [version, media_file]
+
+    # 23 MB cut at 8 MB is 8 + 8 + 7, so both listed parts are full-size ones.
+    monkeypatch.setattr(
+        upload_module, "list_upload_parts",
+        lambda k, u: _listing((1, pinned), (2, pinned)),
+    )
+
+    resp = client.get(_url(version), headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["chunk_size_bytes"] == pinned
+    # Judged against the pin. Against the constant these are short parts and
+    # nothing counts as held.
+    assert body["held_part_numbers"] == [1, 2]
 
 
 def test_a_backend_without_listparts_resumes_with_nothing_held(

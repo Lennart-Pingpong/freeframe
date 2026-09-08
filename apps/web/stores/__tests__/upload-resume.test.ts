@@ -277,6 +277,43 @@ describe('resumeUpload', () => {
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('failed'))
   })
 
+  it('reports an upload that already landed as landed, not as failed', async () => {
+    // `/parts` answers 409 for any status that is not `uploading`, which
+    // includes `processing` and `ready`. Taken as final, that put a red Failed
+    // badge reading "This upload is already ready." on a file that uploaded and
+    // transcoded perfectly -- the one message the mapping got wrong.
+    vi.mocked(api.get).mockImplementation((path: string) => {
+      if (String(path).startsWith('/upload/')) {
+        return Promise.reject(new ApiError(409, 'This upload is already ready.'))
+      }
+      return Promise.resolve({
+        id: ASSET_ID,
+        latest_version: { id: VERSION_ID, processing_status: 'ready' },
+      }) as never
+    })
+
+    useUploadStore.getState().resumeUpload('row-1', makeFile())
+
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('complete'))
+    expect(rowOf('row-1').progress).toBe(100)
+  })
+
+  it('is still failed when the version really did fail', async () => {
+    // The refusal is only worth a second question, not the benefit of the doubt.
+    vi.mocked(api.get).mockImplementation((path: string) => {
+      if (String(path).startsWith('/upload/')) {
+        return Promise.reject(new ApiError(409, 'This upload is already failed.'))
+      }
+      return Promise.resolve({
+        id: ASSET_ID,
+        latest_version: { id: VERSION_ID, processing_status: 'failed' },
+      }) as never
+    })
+
+    useUploadStore.getState().resumeUpload('row-1', makeFile())
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('failed'))
+  })
+
   it('stays resumable when the server merely could not be reached', async () => {
     vi.mocked(api.get).mockRejectedValue(new ApiError(503, 'Could not reach storage.'))
 
@@ -319,6 +356,19 @@ describe('discardUpload', () => {
     expect(useUploadStore.getState().files).toEqual([])
   })
 
+  it('does not publish an upload the user asked to be rid of', async () => {
+    // `/upload/abort` takes its own branch when the object is already whole: it
+    // promotes the version and dispatches the transcode. So the one control
+    // that exists to throw an upload away published it instead, after the row
+    // had already left the panel.
+    vi.mocked(api.get).mockResolvedValue(resumeInfo({ state: 'assembled' }) as never)
+
+    await useUploadStore.getState().discardUpload('row-1')
+
+    expect(vi.mocked(api.post).mock.calls.some(([p]) => p === '/upload/abort')).toBe(false)
+    expect(useUploadStore.getState().files).toEqual([])
+  })
+
   it('removes the row even when the server cannot be told', async () => {
     // What is left in the bucket is the reaper's job, and it has the activity
     // timestamp it needs. Leaving the row would be a button that does nothing.
@@ -327,5 +377,125 @@ describe('discardUpload', () => {
     await useUploadStore.getState().discardUpload('row-1')
 
     expect(useUploadStore.getState().files).toEqual([])
+  })
+})
+
+// ------------------------------------------------- the chunk size a fresh upload cuts on
+
+describe('a fresh upload and the pinned chunk size', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useUploadStore.setState({ files: [] })
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true, headers: { get: () => '"etag"' },
+    }) as never
+  })
+
+  /** Initiate answers with `pinned`; everything after it succeeds. */
+  function mockInitiate(pinned: number) {
+    vi.mocked(api.post).mockImplementation((path: string, body?: unknown) => {
+      if (path === '/upload/initiate' || String(path).endsWith('/versions')) {
+        return Promise.resolve({
+          upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
+          version_id: VERSION_ID, chunk_size_bytes: pinned,
+        }) as never
+      }
+      if (path === '/upload/presign-part') {
+        return Promise.resolve({
+          presigned_url: `https://s3.example/part-${(body as { part_number: number }).part_number}`,
+        }) as never
+      }
+      return Promise.resolve({}) as never
+    })
+  }
+
+  it('cuts on the size the server recorded, not on its own constant', async () => {
+    // The column the migration adds records what the browser used. If the
+    // browser uses something else, `_pinned_chunk_size` trusts the record,
+    // every held part is rejected as the wrong size, and the upload the
+    // pinning exists to rescue is the one that cannot be resumed.
+    mockInitiate(5 * MB)
+
+    useUploadStore.getState().startUpload(makeFile(), 'project-1', 'clip')
+
+    // 23 MB at 5 MB a part is five parts; at the client's own 10 MB it is three.
+    await vi.waitFor(() =>
+      expect(partsSentTo(global.fetch as never)).toEqual([1, 2, 3, 4, 5]),
+    )
+  })
+
+  it('does the same for a new version of an existing asset', async () => {
+    mockInitiate(5 * MB)
+
+    useUploadStore.getState().startVersionUpload(makeFile(), ASSET_ID, 'clip', 'project-1')
+
+    await vi.waitFor(() =>
+      expect(partsSentTo(global.fetch as never)).toEqual([1, 2, 3, 4, 5]),
+    )
+  })
+})
+
+// ------------------------------------------------------- reconciling against the server
+
+describe('refreshProcessingItems', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  function seedRow(over: Record<string, unknown>) {
+    return {
+      id: 'row-1', fileName: 'clip.mp4', fileSize: TOTAL, fileType: 'video/mp4',
+      projectId: 'project-1', assetName: 'clip', progress: 0, processingProgress: 0,
+      status: 'interrupted', assetId: ASSET_ID, versionId: VERSION_ID,
+      createdAt: Date.now(), ...over,
+    }
+  }
+
+  function assetWith(versionId: string, status: string) {
+    return { id: ASSET_ID, latest_version: { id: versionId, processing_status: status } }
+  }
+
+  it('leaves an interrupted row alone when the answer is about another version', async () => {
+    // `GET /assets/{id}` answers with the display version, which excludes
+    // `uploading`, so for an interrupted v2 it hands back a ready v1. Taken at
+    // face value the row was rewritten to complete: Resume and Discard
+    // disappeared, the user was told the upload landed, and the parts sat in
+    // the bucket until the reaper.
+    useUploadStore.setState({ files: [seedRow({})] as never })
+    vi.mocked(api.get).mockResolvedValue(assetWith('an-older-version', 'ready') as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('interrupted')
+  })
+
+  it('still follows the answer when it is about its own version', async () => {
+    // The reason interrupted rows are polled at all: the same upload can be
+    // resumed from another tab or another machine.
+    useUploadStore.setState({ files: [seedRow({})] as never })
+    vi.mocked(api.get).mockResolvedValue(assetWith(VERSION_ID, 'processing') as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('processing')
+  })
+
+  it('gives two rows on one asset their own answers', async () => {
+    // An interrupted v2 and a processing v3 read the same result when the
+    // lookup is keyed on the asset.
+    useUploadStore.setState({
+      files: [
+        seedRow({ id: 'row-1', versionId: 'v2', status: 'interrupted' }),
+        seedRow({ id: 'row-2', versionId: 'v3', status: 'processing' }),
+      ] as never,
+    })
+    vi.mocked(api.get)
+      .mockResolvedValueOnce(assetWith('v2', 'ready') as never)
+      .mockResolvedValueOnce(assetWith('v3', 'ready') as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('complete')
+    expect(rowOf('row-2').status).toBe('complete')
   })
 })
