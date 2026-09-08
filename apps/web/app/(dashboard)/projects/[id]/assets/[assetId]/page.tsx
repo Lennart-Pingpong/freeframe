@@ -143,6 +143,23 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     onTranscodeFailed: (d) => refetchIfThisAsset(d.asset_id),
   })
 
+  // Transcode events are not the only thing that changes this list. Discarding
+  // an upload deletes its version and produces no event at all, so the switcher
+  // went on offering a version that was gone -- still labelled "Uploading",
+  // which was the one thing it certainly was not.
+  //
+  // The store says when it has changed versions behind the panel, and says it
+  // after the server has answered rather than when the row leaves the list:
+  // discard removes the row first so the button never looks inert, and
+  // refetching then would race the request that does the deleting.
+  const versionsChangedAt = useUploadStore((s) => s.versionsChangedAt)
+  const lastVersionsChange = useRef(versionsChangedAt)
+  useEffect(() => {
+    if (lastVersionsChange.current === versionsChangedAt) return
+    lastVersionsChange.current = versionsChangedAt
+    if (asset?.id) refetchVersions()
+  }, [versionsChangedAt, asset?.id, refetchVersions])
+
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation
   useEffect(() => {
