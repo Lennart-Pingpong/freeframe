@@ -966,18 +966,20 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     if (!row.versionId) return
     try {
       const info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`)
-      // `/upload/abort` takes its own branch when the object is already whole:
-      // it promotes the version to `processing` and dispatches the transcode.
-      // Sending it here would mean the one control that exists to throw an
-      // upload away publishes it instead, after the row has already left the
-      // panel. Nothing is called for an assembled upload; the version stays
-      // `uploading` with no client behind it, which is exactly what the stale
-      // upload reaper sweeps, and it has the activity timestamp to do it.
-      if (info.state === 'assembled') return
+      // `discard` and not a plain abort. A plain abort marks the version
+      // `failed`, which leaves a red badge in the version switcher for an
+      // upload somebody deliberately threw away -- and it takes its own branch
+      // when the object is already whole, promoting the version and dispatching
+      // the transcode, so the one control that exists to throw an upload away
+      // published it instead. A discard says which of the two this is, and the
+      // server disposes of it the way the reaper disposes of a stale upload:
+      // bytes gone, version gone, and the asset with it if that was its only
+      // version.
       await api.post('/upload/abort', {
         s3_key: info.s3_key,
         upload_id: info.upload_id,
         version_id: info.version_id,
+        discard: true,
       })
     } catch {
       // The row is gone from the panel either way. What is left in the bucket is

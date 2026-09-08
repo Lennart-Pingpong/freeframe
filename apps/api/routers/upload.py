@@ -802,6 +802,24 @@ def abort_upload(
             headers={"Retry-After": "5"},
         ) from e
 
+    # A discard is not a failure, and it is answered before anything is inspected.
+    # The user asked for this upload to be gone, so whether the object happens to
+    # be assembled makes no difference to what should happen to it -- and taking
+    # the assembled branch below would publish the upload the button exists to
+    # throw away. Only an upload still in progress can be discarded: the flag must
+    # not become a way to delete a version that already landed.
+    if body.discard and version.processing_status == ProcessingStatus.uploading:
+        from ..tasks.cleanup_tasks import (
+            _dispose_version_files, _strip_asset_with_no_versions,
+        )
+        asset_id = version.asset_id
+        _dispose_version_files(db, version)
+        db.flush()
+        _strip_asset_with_no_versions(db, asset_id)
+        db.commit()
+        logger.info("upload %s discarded on request", version.id)
+        return
+
     # Only an upload still in progress is resolved here. The client fires this from
     # the catch of every completion failure, so a version that already reached
     # `processing` must be left alone.

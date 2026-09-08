@@ -106,6 +106,12 @@ class AbortUploadRequest(BaseModel):
     s3_key: str
     upload_id: str
     version_id: uuid.UUID
+    # A person pressing Discard, as opposed to an upload that gave up. The two
+    # want different things left behind: a failure is worth seeing in the
+    # version list, a discard is not -- it is a red "Failed" badge on a version
+    # somebody deliberately threw away. Set, the upload is disposed of the way
+    # the reaper disposes of a stale one, only now instead of in a day.
+    discard: bool = False
 
 
 class ResumeUploadResponse(BaseModel):
