@@ -1118,17 +1118,47 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 export const useUploadStore = create<UploadStore>()(
   persist(storeCreator, {
     name: 'ff-uploads',
-    // Terminal rows plus the resumable ones. Successful uploads are fetched from
-    // the API history on panel open, so they are not kept here; an `interrupted`
-    // row is, because it is an offer to carry on and the user is likely to
-    // reload before taking it up. Rows still in flight are still excluded: a
-    // reload kills the transfer, and the version comes back from history as
-    // `interrupted` on its own.
+    // Terminal rows plus everything that can still be carried on. Successful
+    // uploads are fetched from the API history on panel open, so they are not
+    // kept here.
+    //
+    // Rows still in flight are kept too. They used to be dropped, on the
+    // reasoning that a reload kills the transfer and the version comes back
+    // from history as `interrupted` on its own -- which holds only for an asset
+    // with nothing else to show. `/me/assets` reports the display version, and
+    // that skips `uploading`, so reloading during the upload of a SECOND
+    // version got the previous version back instead: one row, marked complete,
+    // no offer to resume anywhere in the panel, and the parts left sitting in
+    // the bucket until the reaper. The row is the only thing that knows the
+    // upload happened, so it has to survive.
     partialize: (state: UploadStore) => ({
       files: state.files.filter(
         (f: UploadFile) =>
-          f.status === 'failed' || f.status === 'cancelled' || f.status === 'interrupted',
+          f.status === 'failed' || f.status === 'cancelled' ||
+          f.status === 'interrupted' || f.status === 'uploading',
       ),
     }),
+    // Nothing is pushing bytes for a row that came out of storage, whatever it
+    // said when it was written, so an in-flight row is rewritten on the way in.
+    // A row that never reached an upload id has nothing to come back to and is
+    // failed -- the same rule the upload loop applies when a transfer breaks.
+    // Done in `merge` rather than after rehydration so the panel never renders
+    // a row claiming to be uploading.
+    merge: (persisted, current) => {
+      const stored = (persisted as { files?: UploadFile[] } | undefined)?.files ?? []
+      return {
+        ...current,
+        ...(persisted as object),
+        files: stored.map((f) =>
+          f.status === 'uploading'
+            ? {
+                ...f,
+                status: (f.versionId && f.uploadId ? 'interrupted' : 'failed') as UploadStatus,
+                error: f.versionId && f.uploadId ? undefined : 'Upload interrupted',
+              }
+            : f,
+        ),
+      }
+    },
   }),
 )
