@@ -396,7 +396,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             onChange={async (e) => {
               const file = e.target.files?.[0]
               if (!file || !asset) return
-              startVersionUpload(file, asset.id, asset.name, asset.project_id)
+              startVersionUpload(file, asset.id, asset.name, asset.project_id, project?.name)
               e.target.value = ''
               // Surface the newly-created version (starts as "uploading") quickly;
               // SSE transcode events then drive it through processing → ready (#118).

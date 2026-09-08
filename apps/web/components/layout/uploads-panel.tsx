@@ -125,6 +125,13 @@ function UploadItem({ upload }: { upload: UploadFile }) {
           <StatusBadge status={upload.status} />
         </div>
         <p className="text-xs text-text-tertiary truncate mt-0.5">
+          {/* The file, whenever it is not simply the asset's name. Uploading a
+              new version names the row after the asset, so the row read
+              "Fujitsu 1.1" while a completely different file was going up --
+              and the panel is the one place that should say which file. */}
+          {upload.fileName && upload.fileName !== upload.assetName && (
+            <>{upload.fileName} &middot; </>
+          )}
           {upload.projectName || upload.projectId.slice(0, 8)} &middot; {formatBytes(upload.fileSize)}
         </p>
 
