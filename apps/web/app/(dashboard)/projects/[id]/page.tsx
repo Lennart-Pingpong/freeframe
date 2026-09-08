@@ -369,20 +369,29 @@ export default function ProjectDetailPage() {
   // the next reports "no folder" in between -- and clearing at once makes the
   // big frame flash on and off in that gap. Any folder claiming the drag
   // cancels a pending release, so the handover looks like one thing moving.
-  const setFolderTarget = React.useCallback((folderId: string | null) => {
-    if (folderClearTimer.current) {
-      clearTimeout(folderClearTimer.current);
-      folderClearTimer.current = null;
-    }
-    if (folderId !== null) {
-      setFileDragFolderId(folderId);
-      return;
-    }
-    folderClearTimer.current = setTimeout(() => {
-      folderClearTimer.current = null;
-      setFileDragFolderId(null);
-    }, 90);
-  }, []);
+  const setFolderTarget = React.useCallback(
+    (folderId: string | null, from?: string) => {
+      if (folderClearTimer.current) {
+        clearTimeout(folderClearTimer.current);
+        folderClearTimer.current = null;
+      }
+      if (folderId !== null) {
+        setFileDragFolderId(folderId);
+        return;
+      }
+      folderClearTimer.current = setTimeout(() => {
+        folderClearTimer.current = null;
+        // Only the folder that still holds the marking may end it. Crossing
+        // from one folder to the next raises the new folder's `dragenter`
+        // BEFORE the old folder's `dragleave`, so the release arriving last
+        // belongs to the folder already left behind -- and acting on it took
+        // the marking off the folder under the pointer and put the whole-area
+        // frame back up beside it.
+        setFileDragFolderId((cur) => (from && cur !== from ? cur : null));
+      }, 90);
+    },
+    [],
+  );
 
   React.useEffect(
     () => () => {
@@ -561,6 +570,7 @@ export default function ProjectDetailPage() {
             }}
             onDropFiles={canDropFiles ? handleDropFilesToFolder : undefined}
             onFileDragOverFolder={canDropFiles ? setFolderTarget : undefined}
+            fileDragTarget={fileDragFolderId}
             onDropItems={async (targetFolderId, assetIds, folderIds) => {
               await bulkMove(assetIds, folderIds, targetFolderId);
               mutateAssets();
@@ -873,6 +883,7 @@ export default function ProjectDetailPage() {
               }}
               onDropFilesToFolder={canDropFiles ? handleDropFilesToFolder : undefined}
               onFileDragOverFolder={canDropFiles ? setFolderTarget : undefined}
+              fileDragTarget={fileDragFolderId}
               onDropToFolder={async (targetFolderId, assetIds, folderIds) => {
                 await bulkMove(assetIds, folderIds, targetFolderId);
                 mutateAssets();

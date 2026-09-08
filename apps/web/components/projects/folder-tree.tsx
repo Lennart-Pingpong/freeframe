@@ -32,7 +32,10 @@ interface FolderTreeProps {
    *  root. Absent = uploads not allowed. */
   onDropFiles?: (targetFolderId: string | null, files: File[]) => void
   /** See FolderCard: lets the region above shrink its marking to this row. */
-  onFileDragOverFolder?: (folderId: string | null) => void
+  onFileDragOverFolder?: (folderId: string | null, from?: string) => void
+  /** Which folder currently holds the file-drag marking, so exactly one row can
+   *  be lit. See FolderCard. */
+  fileDragTarget?: string | null
 }
 
 interface FolderNodeProps {
@@ -47,7 +50,9 @@ interface FolderNodeProps {
   /** Files dropped on a folder row upload into it. Absent = uploads not allowed. */
   onDropFiles?: (targetFolderId: string, files: File[]) => void
   /** See FolderCard: lets the region above shrink its marking to this row. */
-  onFileDragOverFolder?: (folderId: string | null) => void
+  onFileDragOverFolder?: (folderId: string | null, from?: string) => void
+  /** See FolderTreeProps. */
+  fileDragTarget?: string | null
 }
 
 function FolderNode({
@@ -61,6 +66,7 @@ function FolderNode({
   onDropItems,
   onDropFiles,
   onFileDragOverFolder,
+  fileDragTarget,
 }: FolderNodeProps) {
   const [expanded, setExpanded] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -90,8 +96,8 @@ function FolderNode({
   const clearDrag = useCallback(() => {
     dragDepth.current = 0
     setIsDragOver(false)
-    onFileDragOverFolder?.(null)
-  }, [onFileDragOverFolder])
+    onFileDragOverFolder?.(null, node.id)
+  }, [node.id, onFileDragOverFolder])
 
   const handleDragEnter = useCallback((e: React.DragEvent) => {
     if (!carriesFiles(e) || !onDropFiles) return
@@ -100,7 +106,7 @@ function FolderNode({
     // against dragleave to know when the pointer has left it entirely, and
     // swallowing one half of that pair makes its counter drift.
     dragDepth.current += 1
-    setIsDragOver(true)
+    // See FolderCard: the marking is owned above, so two rows cannot both light.
     onFileDragOverFolder?.(node.id)
   }, [node.id, onDropFiles, onFileDragOverFolder])
 
@@ -119,12 +125,14 @@ function FolderNode({
       }
       e.stopPropagation()
       e.dataTransfer.dropEffect = 'copy'
+      // Re-asserted on every dragover; see FolderCard.
+      onFileDragOverFolder?.(node.id)
       return
     }
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
     setIsDragOver(true)
-  }, [onDropFiles])
+  }, [node.id, onDropFiles, onFileDragOverFolder])
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     if (carriesFiles(e) && onDropFiles) {
@@ -171,7 +179,7 @@ function FolderNode({
           isActive
             ? 'bg-accent/10 text-accent font-medium'
             : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover',
-          isDragOver && 'ring-2 ring-accent/50 bg-accent/5',
+          (isDragOver || fileDragTarget === node.id) && 'ring-2 ring-accent/50 bg-accent/5',
         )}
         style={{ paddingLeft: `${8 + depth * 16}px` }}
         onClick={handleClick}
@@ -288,6 +296,7 @@ function FolderNode({
               onDropItems={onDropItems}
               onDropFiles={onDropFiles}
               onFileDragOverFolder={onFileDragOverFolder}
+              fileDragTarget={fileDragTarget}
             />
           ))}
         </div>
@@ -309,6 +318,7 @@ export function FolderTree({
   onDropItems,
   onDropFiles,
   onFileDragOverFolder,
+  fileDragTarget,
 }: FolderTreeProps) {
   const [isDragOverRoot, setIsDragOverRoot] = useState(false)
 
@@ -375,6 +385,7 @@ export function FolderTree({
           onDropItems={onDropItems}
           onDropFiles={onDropFiles}
           onFileDragOverFolder={onFileDragOverFolder}
+          fileDragTarget={fileDragTarget}
         />
       ))}
 

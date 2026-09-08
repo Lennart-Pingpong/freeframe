@@ -118,3 +118,43 @@ describe('dropping a file on the sidebar tree', () => {
     expect(onDropItems).toHaveBeenCalledWith('episodes', ['a1'], [])
   })
 })
+
+describe('which row is lit while a file is dragged over the tree', () => {
+  const lit = (el: HTMLElement) => el.closest('div')!.className.includes('ring-accent/50')
+
+  it('lights the row the region says is the target, and only that one', () => {
+    // The marking is owned by the region rather than by each row agreeing with
+    // the others, so "exactly one frame is lit" is a property of the state.
+    renderTree({ onDropFiles: vi.fn(), fileDragTarget: 'episodes' })
+    fireEvent.click(screen.getByText('Episodes'))
+
+    expect(lit(screen.getByText('Episodes'))).toBe(true)
+    expect(lit(screen.getByText('Episode 04'))).toBe(false)
+  })
+
+  it('names itself when it lets the marking go', () => {
+    // Crossing between two folders raises the new row's dragenter before the
+    // old row's dragleave, so a release that does not say where it came from
+    // takes the marking off the row now under the pointer -- and the whole-area
+    // frame comes back up beside it.
+    const onFileDragOverFolder = vi.fn()
+    renderTree({ onDropFiles: vi.fn(), onFileDragOverFolder })
+
+    const row = screen.getByText('Episodes')
+    fireEvent.dragEnter(row, { dataTransfer: fileDrag() })
+    fireEvent.dragLeave(row, { dataTransfer: fileDrag() })
+
+    expect(onFileDragOverFolder).toHaveBeenCalledWith('episodes')
+    expect(onFileDragOverFolder).toHaveBeenLastCalledWith(null, 'episodes')
+  })
+
+  it('re-asserts the claim on every dragover', () => {
+    // What lets the marking recover by itself if anything releases it early.
+    const onFileDragOverFolder = vi.fn()
+    renderTree({ onDropFiles: vi.fn(), onFileDragOverFolder })
+
+    fireEvent.dragOver(screen.getByText('Episodes'), { dataTransfer: fileDrag() })
+
+    expect(onFileDragOverFolder).toHaveBeenCalledWith('episodes')
+  })
+})
