@@ -28,8 +28,9 @@ interface FolderTreeProps {
   onDeleteFolder: (folderId: string) => Promise<void>
   // Drag-drop targets
   onDropItems?: (targetFolderId: string | null, assetIds: string[], folderIds: string[]) => void
-  /** Files dropped on a folder row upload into it. Absent = uploads not allowed. */
-  onDropFiles?: (targetFolderId: string, files: File[]) => void
+  /** Files dropped on a folder row upload into it, `null` being the project
+   *  root. Absent = uploads not allowed. */
+  onDropFiles?: (targetFolderId: string | null, files: File[]) => void
   /** See FolderCard: lets the region above shrink its marking to this row. */
   onFileDragOverFolder?: (folderId: string | null) => void
 }
@@ -106,8 +107,16 @@ function FolderNode({
   // Drag-drop target
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (carriesFiles(e)) {
-      if (!onDropFiles) return
+      // Refusing still means preventing the default. Without it the browser
+      // handles the drop itself and navigates the tab to `file:///...`, losing
+      // whatever is unsaved -- and this row sits outside the asset area, so
+      // there is no ancestor to cancel it on our behalf. `none` is what tells
+      // the pointer it cannot be dropped here.
       e.preventDefault()
+      if (!onDropFiles) {
+        e.dataTransfer.dropEffect = 'none'
+        return
+      }
       e.stopPropagation()
       e.dataTransfer.dropEffect = 'copy'
       return
@@ -130,12 +139,16 @@ function FolderNode({
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       if (carriesFiles(e)) {
-        if (!onDropFiles) return
+        // See handleDragOver: prevented whether or not it is accepted.
         e.preventDefault()
+        if (!onDropFiles) return
         e.stopPropagation()
         clearDrag()
-        const files = Array.from(e.dataTransfer.files)
-        if (files.length > 0) onDropFiles(node.id, files)
+        // Handed over even when the list is empty, which is what several
+        // promised-file sources on macOS produce: the caller owns the region
+        // marking, and it has to come down either way. Uploading nothing is a
+        // no-op there.
+        onDropFiles(node.id, Array.from(e.dataTransfer.files))
         return
       }
       e.preventDefault()
@@ -312,6 +325,20 @@ export function FolderTree({
         )}
         onClick={() => onSelectFolder(null)}
         onDragOver={(e) => {
+          if (carriesFiles(e)) {
+            // Prevented either way, or the browser navigates away from the app
+            // to display the file. Lit only when there is somewhere for it to
+            // go: a row that highlights and then swallows the drop is worse
+            // than one that never offered.
+            e.preventDefault()
+            if (!onDropFiles) {
+              e.dataTransfer.dropEffect = 'none'
+              return
+            }
+            e.dataTransfer.dropEffect = 'copy'
+            setIsDragOverRoot(true)
+            return
+          }
           e.preventDefault()
           setIsDragOverRoot(true)
         }}
@@ -319,6 +346,11 @@ export function FolderTree({
         onDrop={(e) => {
           e.preventDefault()
           setIsDragOverRoot(false)
+          if (carriesFiles(e)) {
+            // `null` is the project root, which is the folder this row means.
+            onDropFiles?.(null, Array.from(e.dataTransfer.files))
+            return
+          }
           try {
             const data = JSON.parse(e.dataTransfer.getData('application/json'))
             onDropItems?.(null, data.assetIds ?? [], data.folderIds ?? [])
@@ -341,6 +373,8 @@ export function FolderTree({
           onRenameFolder={onRenameFolder}
           onDeleteFolder={onDeleteFolder}
           onDropItems={onDropItems}
+          onDropFiles={onDropFiles}
+          onFileDragOverFolder={onFileDragOverFolder}
         />
       ))}
 

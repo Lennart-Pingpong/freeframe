@@ -392,8 +392,12 @@ export default function ProjectDetailPage() {
   );
   // Not the trash and not the share-link list: neither can receive an upload,
   // and `canUpload` is owner/editor, so a reviewer never gets an affordance
-  // that ends in a 403.
-  const canDropFiles = canUpload && !showTrash && !showShareLinks;
+  // that ends in a 403. Not while the upload dialog is open either: its
+  // backdrop covers the region and is portalled from inside it, so the drop
+  // bubbles here and passes the release check, starting an upload behind a
+  // dialog that is asking about a different one.
+  const canDropFiles =
+    canUpload && !showTrash && !showShareLinks && !uploadOpen;
 
   const handleFileDragEnter = (e: React.DragEvent) => {
     if (!canDropFiles || !carriesFiles(e)) return;
@@ -458,7 +462,11 @@ export default function ProjectDetailPage() {
     );
   };
 
-  const handleDropFilesToFolder = (targetFolderId: string, files: File[]) => {
+  // `null` is the project root, which is what the tree's root row reports.
+  const handleDropFilesToFolder = (
+    targetFolderId: string | null,
+    files: File[],
+  ) => {
     setFolderTarget(null);
     setIsFileDragOver(false);
     dropDepth.current = 0;

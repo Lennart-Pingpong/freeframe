@@ -173,12 +173,17 @@ export function FolderCard({
   // Drop target
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (carriesFiles(e)) {
-      // A folder is a more specific target than the region behind it, so it
-      // takes the event rather than letting it through. Without onDropFiles
-      // there is nothing to take it with -- a reviewer, or a caller with no
-      // upload path -- and it falls through as before.
-      if (!onDropFiles) return
+      // Prevented before anything else. A reviewer, correctly given no upload
+      // handler, used to fall through to the browser's own file handling,
+      // which navigates the tab to `file:///...` and takes the app with it.
+      // Refusing has to be explicit; `none` is what says so to the pointer.
       e.preventDefault()
+      if (!onDropFiles) {
+        e.dataTransfer.dropEffect = 'none'
+        return
+      }
+      // A folder is a more specific target than the region behind it, so it
+      // takes the event rather than letting it through.
       e.stopPropagation()
       e.dataTransfer.dropEffect = 'copy'
       return
@@ -191,13 +196,17 @@ export function FolderCard({
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       if (carriesFiles(e)) {
-        if (!onDropFiles) return
+        // See handleDragOver: prevented whether or not it is accepted.
         e.preventDefault()
+        if (!onDropFiles) return
         // Stops the region above uploading the same files into the open folder.
         e.stopPropagation()
         clearDrag()
-        const files = Array.from(e.dataTransfer.files)
-        if (files.length > 0) onDropFiles(folder.id, files)
+        // Handed over even when the list is empty, which is what several
+        // promised-file sources on macOS produce. The region behind this card
+        // never sees the drop, so its marking comes down through this call and
+        // nothing else: skipping it leaves "Drop to upload" on screen for good.
+        onDropFiles(folder.id, Array.from(e.dataTransfer.files))
         return
       }
       e.preventDefault()
