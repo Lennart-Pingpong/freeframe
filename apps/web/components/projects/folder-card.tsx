@@ -91,8 +91,13 @@ interface FolderCardProps {
   onDropFiles?: (targetFolderId: string, files: File[]) => void
   /** Tells the region above that a file drag is over this folder, so it can
    *  shrink its own marking to this one -- two frames lit at once do not say
-   *  where the file will land. */
-  onFileDragOverFolder?: (folderId: string | null) => void
+   *  where the file will land. On release the folder names itself, so a leave
+   *  arriving after the next folder has claimed the drag cannot end its turn. */
+  onFileDragOverFolder?: (folderId: string | null, from?: string) => void
+  /** Whether this folder is the current file-drag target. Owned by the region
+   *  rather than by the card: only one folder can hold it, so "exactly one
+   *  frame is lit" is a property of the state and not of the cards agreeing. */
+  fileDragActive?: boolean
   className?: string
 }
 
@@ -107,6 +112,7 @@ export function FolderCard({
   onDropItems,
   onDropFiles,
   onFileDragOverFolder,
+  fileDragActive,
   className,
 }: FolderCardProps) {
   const [menuOpen, setMenuOpen] = useState(false)
@@ -146,8 +152,8 @@ export function FolderCard({
   const clearDrag = useCallback(() => {
     dragDepth.current = 0
     setIsDragOver(false)
-    onFileDragOverFolder?.(null)
-  }, [onFileDragOverFolder])
+    onFileDragOverFolder?.(null, folder.id)
+  }, [folder.id, onFileDragOverFolder])
 
   const handleDragEnter = useCallback((e: React.DragEvent) => {
     if (!carriesFiles(e) || !onDropFiles) return
@@ -156,7 +162,8 @@ export function FolderCard({
     // against dragleave to know when the pointer has left it entirely, and
     // swallowing one half of that pair makes its counter drift.
     dragDepth.current += 1
-    setIsDragOver(true)
+    // No local highlight for a file drag: `fileDragActive` decides that, so two
+    // cards cannot both be lit while the pointer is between them.
     onFileDragOverFolder?.(folder.id)
   }, [folder.id, onDropFiles, onFileDragOverFolder])
 
@@ -186,12 +193,15 @@ export function FolderCard({
       // takes the event rather than letting it through.
       e.stopPropagation()
       e.dataTransfer.dropEffect = 'copy'
+      // Re-asserted on every dragover, not only on entry: this is what makes
+      // the marking recover by itself if anything ever releases it early.
+      onFileDragOverFolder?.(folder.id)
       return
     }
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
     setIsDragOver(true)
-  }, [onDropFiles])
+  }, [folder.id, onDropFiles, onFileDragOverFolder])
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -227,7 +237,7 @@ export function FolderCard({
         className={cn(
           'group relative rounded-lg border bg-bg-tertiary/50 cursor-pointer transition-all hover:border-border-focus hover:scale-[1.01]',
           selected ? 'ring-2 ring-accent border-accent/50' : 'border-border',
-          isDragOver && 'ring-2 ring-accent/50 bg-accent/5',
+          (isDragOver || fileDragActive) && 'ring-2 ring-accent/50 bg-accent/5',
           menuOpen && 'z-[60]',
           className,
         )}
