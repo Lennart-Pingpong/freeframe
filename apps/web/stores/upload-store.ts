@@ -418,6 +418,11 @@ const abortControllers: Record<string, AbortController> = {}
 
 interface UploadStore {
   files: UploadFile[]
+  /** Bumped when something here has changed an asset's versions server-side in
+   *  a way no transcode event announces -- today, discarding an upload, which
+   *  deletes the version. A screen showing a version list watches this so it
+   *  does not go on offering a version that is gone. */
+  versionsChangedAt: number
   panelOpen: boolean
   historyLoaded: boolean
   historyHasMore: boolean
@@ -563,6 +568,7 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
 
 const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = (set, get) => ({
   files: [],
+  versionsChangedAt: 0,
   panelOpen: false,
   historyLoaded: false,
   historyHasMore: true,
@@ -985,6 +991,15 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     } catch {
       // The row is gone from the panel either way. What is left in the bucket is
       // the reaper's job, and it has the activity timestamp it needs to do it.
+    } finally {
+      // Said after the server has answered, not when the row left the list: a
+      // screen showing this asset's versions has to refetch, and refetching
+      // while the request that deletes the version is still in flight would
+      // fetch the version back. Bumped on the failure path too -- what the
+      // server managed before it stopped answering is not knowable from here,
+      // and a refetch is cheap next to a switcher offering a version that is
+      // gone.
+      set({ versionsChangedAt: Date.now() })
     }
   },
 
