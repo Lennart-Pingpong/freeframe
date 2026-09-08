@@ -158,3 +158,51 @@ describe('which row is lit while a file is dragged over the tree', () => {
     expect(onFileDragOverFolder).toHaveBeenCalledWith('episodes')
   })
 })
+
+describe('what reaches the page behind the tree', () => {
+  /** The tree inside something that refuses whatever nothing claimed. */
+  function renderInPage(props: Record<string, unknown> = {}) {
+    const onPage = vi.fn()
+    const view = render(
+      <div onDragOver={onPage} onDrop={onPage}>
+        <FolderTree
+          tree={tree}
+          projectName="Season 2"
+          currentFolderId={null}
+          showTrash={false}
+          onSelectFolder={() => {}}
+          onShowTrash={() => {}}
+          onCreateFolder={noop}
+          onRenameFolder={noop}
+          onDeleteFolder={noop}
+          {...props}
+        />
+      </div>,
+    )
+    return { onPage, view }
+  }
+
+  it('keeps a drop a row has taken', () => {
+    // Or the page would refuse the cursor over the one place it can be dropped.
+    const { onPage } = renderInPage({ onDropFiles: vi.fn() })
+
+    fireEvent.dragOver(screen.getByText('Episodes'), { dataTransfer: fileDrag() })
+    fireEvent.drop(screen.getByText('Episodes'), { dataTransfer: fileDrag() })
+
+    expect(onPage).not.toHaveBeenCalled()
+  })
+
+  it('lets a drop nothing claimed through', () => {
+    // The two pixels of gap between two rows belong to the tree's own
+    // background. Nothing there handles a file, so the page above has to get
+    // the chance to refuse it -- otherwise the browser takes the drop and
+    // navigates the tab to the file, losing the session. Found by hand in
+    // Safari, on exactly that gap.
+    const { onPage, view } = renderInPage({ onDropFiles: vi.fn() })
+    const treeBackground = view.container.firstChild!.firstChild as Element
+
+    fireEvent.drop(treeBackground, { dataTransfer: fileDrag() })
+
+    expect(onPage).toHaveBeenCalled()
+  })
+})
