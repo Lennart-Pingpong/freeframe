@@ -364,9 +364,23 @@ def initiate_new_version(
     if guard_error:
         raise HTTPException(status_code=400, detail=guard_error)
 
+    # Numbered across every version this asset has ever had, soft-deleted ones
+    # included. `uq_asset_versions_asset_version` spans (asset_id,
+    # version_number) with no regard for `deleted_at`, so counting only live
+    # versions hands back a number the table is still holding: the INSERT dies
+    # on the constraint with a 500, and it does so for good -- the asset can
+    # never be given a version at that number again.
+    #
+    # Reachable without anything unusual happening. The stale-upload reaper
+    # soft-deletes a version whose transfer stopped, so an asset that has had
+    # one upload reclaimed refuses the next one, a day later, with an error
+    # about a database constraint. Discarding an upload does the same in
+    # seconds, which is how this was found.
+    #
+    # Version numbers are therefore monotonic and never reused: after a
+    # discarded v2, the next upload is v3.
     last_version = db.query(AssetVersion).filter(
         AssetVersion.asset_id == asset_id,
-        AssetVersion.deleted_at.is_(None),
     ).order_by(AssetVersion.version_number.desc()).first()
     next_version_number = (last_version.version_number + 1) if last_version else 1
 
