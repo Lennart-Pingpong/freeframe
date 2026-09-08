@@ -421,8 +421,11 @@ interface UploadStore {
   /** Bumped when something here has changed an asset's versions server-side in
    *  a way no transcode event announces -- today, discarding an upload, which
    *  deletes the version. A screen showing a version list watches this so it
-   *  does not go on offering a version that is gone. */
-  versionsChangedAt: number
+   *  does not go on offering a version that is gone.
+   *
+   *  A counter and not a timestamp: two discards inside one millisecond are a
+   *  real thing, and `Date.now()` reports them as no change at all. */
+  versionsRevision: number
   panelOpen: boolean
   historyLoaded: boolean
   historyHasMore: boolean
@@ -568,7 +571,7 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
 
 const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = (set, get) => ({
   files: [],
-  versionsChangedAt: 0,
+  versionsRevision: 0,
   panelOpen: false,
   historyLoaded: false,
   historyHasMore: true,
@@ -999,7 +1002,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       // server managed before it stopped answering is not knowable from here,
       // and a refetch is cheap next to a switcher offering a version that is
       // gone.
-      set({ versionsChangedAt: Date.now() })
+      set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
     }
   },
 

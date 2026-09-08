@@ -152,13 +152,13 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   // after the server has answered rather than when the row leaves the list:
   // discard removes the row first so the button never looks inert, and
   // refetching then would race the request that does the deleting.
-  const versionsChangedAt = useUploadStore((s) => s.versionsChangedAt)
-  const lastVersionsChange = useRef(versionsChangedAt)
+  const versionsRevision = useUploadStore((s) => s.versionsRevision)
+  const lastVersionsRevision = useRef(versionsRevision)
   useEffect(() => {
-    if (lastVersionsChange.current === versionsChangedAt) return
-    lastVersionsChange.current = versionsChangedAt
+    if (lastVersionsRevision.current === versionsRevision) return
+    lastVersionsRevision.current = versionsRevision
     if (asset?.id) refetchVersions()
-  }, [versionsChangedAt, asset?.id, refetchVersions])
+  }, [versionsRevision, asset?.id, refetchVersions])
 
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation
