@@ -345,6 +345,9 @@ export function FolderTree({
               e.dataTransfer.dropEffect = 'none'
               return
             }
+            // Taken, like the rows above: the page refuses whatever reaches it
+            // unclaimed, and would otherwise overwrite the cursor here.
+            e.stopPropagation()
             e.dataTransfer.dropEffect = 'copy'
             setIsDragOverRoot(true)
             return
@@ -357,6 +360,7 @@ export function FolderTree({
           e.preventDefault()
           setIsDragOverRoot(false)
           if (carriesFiles(e)) {
+            if (onDropFiles) e.stopPropagation()
             // `null` is the project root, which is the folder this row means.
             onDropFiles?.(null, Array.from(e.dataTransfer.files))
             return

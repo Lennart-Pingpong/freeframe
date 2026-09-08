@@ -422,7 +422,23 @@ export default function ProjectDetailPage() {
     // Without this the browser handles the drop itself and navigates away from
     // the app to display the file.
     e.preventDefault();
+    // Taken, so the page-level refusal below does not overwrite the cursor with
+    // "you cannot drop here" over the one place where you can.
+    e.stopPropagation();
     e.dataTransfer.dropEffect = "copy";
+  };
+
+  // The page as a whole refuses what nothing in it took.
+  //
+  // Every element that accepts a file stops the event, so anything arriving
+  // here was wanted by nobody -- and left alone it goes to the browser, which
+  // navigates the tab to the file and takes the session with it. The two
+  // pixels of gap between two folder rows in the sidebar are enough to lose
+  // the page that way, which is how this was found.
+  const refuseFileDrag = (e: React.DragEvent) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "none";
   };
 
   const handleFileDragLeave = (e: React.DragEvent) => {
@@ -454,6 +470,9 @@ export default function ProjectDetailPage() {
     setIsFileDragOver(false);
     setFolderTarget(null);
     if (!released) return;
+    // See handleFileDragOver: taken, so the page-level refusal is not also run
+    // for a file this region is about to upload.
+    e.stopPropagation();
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
     // Straight to startUpload rather than through the dialog. Dragging a file
@@ -518,7 +537,11 @@ export default function ProjectDetailPage() {
   );
 
   return (
-    <div className="flex h-full flex-col lg:flex-row overflow-hidden">
+    <div
+      className="flex h-full flex-col lg:flex-row overflow-hidden"
+      onDragOver={refuseFileDrag}
+      onDrop={refuseFileDrag}
+    >
       {/* ─── Left Sidebar (Frame.io style) ──────────────────────────────── */}
       <div className="hidden lg:flex w-72 flex-col border-r border-border bg-bg-secondary shrink-0">
         {/* Assets section */}
