@@ -369,19 +369,22 @@ export interface UploadFile {
   createdAt: number // timestamp for grouping
 }
 
+/** POST /upload/initiate and POST /assets/{id}/versions — both answer with this.
+ *
+ *  `chunk_size_bytes` is the size the server records against the upload, so it
+ *  is the size the browser has to cut on: `_pinned_chunk_size` trusts that
+ *  record over the parts actually held, and a browser cutting on a constant of
+ *  its own would make every held part the wrong size the first time the two
+ *  disagree -- stranding exactly the upload the pinning exists to rescue. */
 interface InitiateResponse {
   upload_id: string
   s3_key: string
   asset_id: string
   version_id: string
+  chunk_size_bytes: number
 }
 
-interface VersionInitiateResponse {
-  upload_id: string
-  s3_key: string
-  asset_id: string
-  version_id: string
-}
+type VersionInitiateResponse = InitiateResponse
 
 /** GET /upload/{version_id}/parts — where to carry on, and what is already there. */
 interface ResumeInfo {
@@ -629,8 +632,11 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 
         updateFile(id, { uploadId: upload_id, assetId: asset_id, versionId: version_id })
 
-        const parts = await uploadAllParts(file, s3_key, upload_id, controller, (percent) =>
-          updateFile(id, { progress: percent }),
+        const parts = await uploadAllParts(
+          file, s3_key, upload_id, controller,
+          (percent) => updateFile(id, { progress: percent }),
+          UPLOAD_CONCURRENCY,
+          { chunkSize: initRes.chunk_size_bytes },
         )
 
         completionAttempted = true
@@ -761,8 +767,11 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         version_id = initRes.version_id
         updateFile(id, { uploadId: upload_id, versionId: version_id })
 
-        const parts = await uploadAllParts(file, s3_key, upload_id, controller, (percent) =>
-          updateFile(id, { progress: percent }),
+        const parts = await uploadAllParts(
+          file, s3_key, upload_id, controller,
+          (percent) => updateFile(id, { progress: percent }),
+          UPLOAD_CONCURRENCY,
+          { chunkSize: initRes.chunk_size_bytes },
         )
 
         completionAttempted = true
@@ -901,8 +910,17 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         } else {
           // See startUpload: the completion may have landed with only its
           // response lost, and this is the second time round for this version.
-          const landed = completionAttempted && info
-            ? await completedVersionStatus(info.asset_id, info.version_id)
+          //
+          // A refusal is asked the same question. `/parts` answers 409 for any
+          // status that is not `uploading`, which includes `processing` and
+          // `ready`: the upload landed and this tab is the last to hear about
+          // it. Treated as final, that put a red Failed badge reading "This
+          // upload is already ready." on a file that uploaded and transcoded
+          // perfectly. `completedVersionStatus` compares version ids, so a
+          // version that really did fail still falls through to `failed`.
+          const askAbout = info?.asset_id ?? row.assetId
+          const landed = (completionAttempted || isFinalRefusal(err)) && askAbout
+            ? await completedVersionStatus(askAbout, versionId)
             : null
           if (landed) {
             if (!userCancelled()) {
@@ -948,6 +966,14 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     if (!row.versionId) return
     try {
       const info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`)
+      // `/upload/abort` takes its own branch when the object is already whole:
+      // it promotes the version to `processing` and dispatches the transcode.
+      // Sending it here would mean the one control that exists to throw an
+      // upload away publishes it instead, after the row has already left the
+      // panel. Nothing is called for an assembled upload; the version stays
+      // `uploading` with no client behind it, which is exactly what the stale
+      // upload reaper sweeps, and it has the activity timestamp to do it.
+      if (info.state === 'assembled') return
       await api.post('/upload/abort', {
         s3_key: info.s3_key,
         upload_id: info.upload_id,
@@ -1059,9 +1085,20 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       set((s) => ({
         files: s.files.map((f) => {
           if ((f.status !== 'processing' && f.status !== 'interrupted') || !f.assetId) return f
-          const idx = watched.findIndex((pf) => pf.assetId === f.assetId)
+          // Matched on the version and not the asset: two rows can watch one
+          // asset -- an interrupted v2 and a processing v3 -- and on the asset
+          // they both read the first one's answer.
+          const idx = watched.findIndex((pf) => pf.id === f.id)
           const asset = idx >= 0 ? results[idx] : null
           if (!asset?.latest_version) return f
+          // `GET /assets/{id}` answers with `_display_version`, which excludes
+          // `uploading`, so for an interrupted second version it hands back the
+          // previous version sitting at `ready`. Without this the row is
+          // rewritten to complete: Resume and Discard disappear, the user is
+          // told the upload landed, and the parts sit in the bucket until the
+          // reaper. This is the guard `completedVersionStatus` carries for the
+          // same reason -- the second half of #273.
+          if (f.versionId && asset.latest_version.id !== f.versionId) return f
           const status = mapProcessingStatus(asset.latest_version.processing_status)
           if (status === f.status) return f
           return {
