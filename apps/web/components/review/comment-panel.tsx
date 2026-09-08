@@ -820,6 +820,15 @@ export function CommentPanel({
   const [fpsPromptFormat, setFpsPromptFormat] =
     React.useState<ExportFormat | null>(null);
 
+  // The refusal is about one asset and one version, so it has to go when
+  // either of them changes. Nothing here remounts on its own: the version
+  // switcher is a sibling of this panel with no `key`, so a message about v2
+  // would otherwise sit above v1's fully timecoded comments, and in compare
+  // mode above the other pane's.
+  React.useEffect(() => {
+    setExportError(null);
+  }, [currentAsset?.id, currentVersion?.id, exportVersionId]);
+
   const searchRef = React.useRef<HTMLInputElement>(null);
 
   React.useEffect(() => {
@@ -1216,6 +1225,9 @@ export function CommentPanel({
               )}
               title="Export comments"
               onClick={() => {
+                // Opening the menu is the start of a new attempt, so the
+                // previous refusal stops being the answer to anything.
+                if (!exportOpen) setExportError(null);
                 setExportOpen((p) => !p);
                 setVisOpen(false);
                 setFilterOpen(false);
