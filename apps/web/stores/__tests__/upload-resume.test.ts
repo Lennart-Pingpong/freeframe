@@ -353,20 +353,29 @@ describe('discardUpload', () => {
       s3_key: 'raw/p/a/v/original.mp4',
       upload_id: 'u1',
       version_id: VERSION_ID,
+      discard: true,
     })
     expect(useUploadStore.getState().files).toEqual([])
   })
 
-  it('does not publish an upload the user asked to be rid of', async () => {
-    // `/upload/abort` takes its own branch when the object is already whole: it
-    // promotes the version and dispatches the transcode. So the one control
-    // that exists to throw an upload away published it instead, after the row
-    // had already left the panel.
+  it('says it is a discard, so nothing is published and nothing is left failed', async () => {
+    // A plain abort publishes an upload whose object is already whole, and
+    // leaves a red Failed badge in the version switcher for one that is not --
+    // for a version somebody deliberately threw away. The flag is what tells
+    // the two apart.
+    await useUploadStore.getState().discardUpload('row-1')
+
+    const abort = vi.mocked(api.post).mock.calls.find(([p]) => p === '/upload/abort')!
+    expect(abort[1]).toMatchObject({ version_id: VERSION_ID, discard: true })
+  })
+
+  it('discards an already assembled upload too', async () => {
     vi.mocked(api.get).mockResolvedValue(resumeInfo({ state: 'assembled' }) as never)
 
     await useUploadStore.getState().discardUpload('row-1')
 
-    expect(vi.mocked(api.post).mock.calls.some(([p]) => p === '/upload/abort')).toBe(false)
+    const abort = vi.mocked(api.post).mock.calls.find(([p]) => p === '/upload/abort')!
+    expect(abort[1]).toMatchObject({ discard: true })
     expect(useUploadStore.getState().files).toEqual([])
   })
 
