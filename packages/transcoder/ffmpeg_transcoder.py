@@ -590,13 +590,30 @@ class FFmpegTranscoder(BaseTranscoder):
             # reach it from any caller, not only from the configured default.
             requested = [q for q in job.qualities if q in QUALITY_MAP] or list(DEFAULT_QUALITIES)
             source_height = (meta.height if meta else 0) or 0
-            qualities = [
-                q for q in requested
-                if int(QUALITY_MAP[q][0].split(":")[1]) <= source_height
-            ]
+            source_width = (meta.width if meta else 0) or 0
+
+            def _rung_height(name: str) -> int:
+                return int(QUALITY_MAP[name][0].split(":")[1])
+
+            qualities = [q for q in requested if _rung_height(q) <= source_height]
+            # What each rung scales to. Its own nominal size, except for the one
+            # kept below.
+            scale_targets = {q: QUALITY_MAP[q][0] for q in requested}
             if not qualities and requested:
-                # Never emit an empty ladder: keep the smallest requested rung.
-                qualities = [min(requested, key=lambda q: int(QUALITY_MAP[q][0].split(":")[1]))]
+                # Never emit an empty ladder: keep the smallest requested rung,
+                # clamped to the source instead of scaled up to its nominal
+                # size. Restoring it unchanged is what made
+                # `TRANSCODER_QUALITIES=1080p` turn a 640x360 upload into a
+                # single upscaled 1920x1080 rendition -- more encode time and
+                # more storage than the source itself, and #201 re-entering
+                # through configuration. Clamped, a one-rung ladder above the
+                # source means "source size", which is the only useful reading
+                # of it. Without probed dimensions there is nothing to clamp
+                # against, so the rung stands as before.
+                smallest = min(requested, key=_rung_height)
+                qualities = [smallest]
+                if source_width and source_height:
+                    scale_targets[smallest] = f"{source_width}:{source_height}"
 
             primary_backend = get_backend()
 
@@ -676,7 +693,7 @@ class FFmpegTranscoder(BaseTranscoder):
                     scale_extra = ""
                 filter_complex = f"{hdr_prefix}{src}split={len(qualities)}{split_outputs};"
                 filter_complex += ";".join(
-                    f"[v{i}]{scale_filter}={QUALITY_MAP[q][0]}:force_original_aspect_ratio=decrease:force_divisible_by=2{scale_extra}[{q}]"
+                    f"[v{i}]{scale_filter}={scale_targets[q]}:force_original_aspect_ratio=decrease:force_divisible_by=2{scale_extra}[{q}]"
                     for i, q in enumerate(qualities)
                 )
 

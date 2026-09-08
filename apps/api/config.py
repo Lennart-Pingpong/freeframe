@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     # An instance whose reviewers all watch at full size pays for the smaller
     # rungs in encode time and in storage without anyone playing them. Rungs
     # above the source resolution are still dropped, so this cannot be used to
-    # ask for more than the source has.
+    # ask for more than the source has: a ladder left empty that way builds its
+    # smallest rung at the source's own size.
     transcoder_qualities: str = "1080p,720p,360p"
 
     # Maximum size (bytes) for a single uploaded file. 0 = unlimited (no per-file cap).
