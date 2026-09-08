@@ -374,7 +374,7 @@ describe('discardUpload', () => {
     // none: it went on offering a version that had been deleted, still
     // labelled "Uploading". The signal comes after the request, because the row
     // leaves the panel before it and refetching then fetches the version back.
-    const before = useUploadStore.getState().versionsChangedAt
+    const before = useUploadStore.getState().versionsRevision
     let abortResolved = false
     vi.mocked(api.post).mockImplementation(async () => {
       await new Promise((r) => setTimeout(r, 10))
@@ -385,17 +385,17 @@ describe('discardUpload', () => {
     await useUploadStore.getState().discardUpload('row-1')
 
     expect(abortResolved).toBe(true)
-    expect(useUploadStore.getState().versionsChangedAt).toBeGreaterThan(before)
+    expect(useUploadStore.getState().versionsRevision).toBe(before + 1)
   })
 
   it('says so even when the server could not be told', async () => {
     // What the server managed before it stopped answering is not knowable here.
-    const before = useUploadStore.getState().versionsChangedAt
+    const before = useUploadStore.getState().versionsRevision
     vi.mocked(api.get).mockRejectedValue(new ApiError(503, 'Could not reach storage.'))
 
     await useUploadStore.getState().discardUpload('row-1')
 
-    expect(useUploadStore.getState().versionsChangedAt).toBeGreaterThan(before)
+    expect(useUploadStore.getState().versionsRevision).toBe(before + 1)
   })
 
   it('discards an already assembled upload too', async () => {
