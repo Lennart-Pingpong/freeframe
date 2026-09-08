@@ -24,6 +24,7 @@ vi.mock('@/lib/api', () => ({
 
 import { api, ApiError } from '@/lib/api'
 import { useUploadStore, uploadAllParts } from '../upload-store'
+import type { UploadFile } from '../upload-store'
 
 const MB = 1024 * 1024
 const CHUNK = 10 * MB
@@ -497,5 +498,70 @@ describe('refreshProcessingItems', () => {
 
     expect(rowOf('row-1').status).toBe('complete')
     expect(rowOf('row-2').status).toBe('complete')
+  })
+})
+
+// -------------------------------------------------- surviving a reload mid-upload
+
+describe('a row that was uploading when the tab reloaded', () => {
+  /** What zustand's persist middleware does on the way in. */
+  function rehydrate(stored: Record<string, unknown>[]): UploadFile[] {
+    const opts = (useUploadStore as unknown as {
+      persist: { getOptions: () => { merge?: (p: unknown, c: unknown) => { files: UploadFile[] } } }
+    }).persist.getOptions()
+    return opts.merge!({ files: stored }, { files: [] }).files
+  }
+
+  const inFlight = {
+    id: 'row-1', fileName: 'clip.mp4', fileSize: TOTAL, fileType: 'video/mp4',
+    projectId: 'project-1', assetName: 'clip', progress: 41, processingProgress: 0,
+    status: 'uploading', assetId: ASSET_ID, versionId: VERSION_ID, uploadId: 'u1',
+    createdAt: Date.now(),
+  }
+
+  it('comes back as interrupted rather than not at all', () => {
+    // It used to be dropped, because history was expected to produce it again.
+    // History reports the display version, which skips `uploading`, so for a
+    // second version it produced the PREVIOUS version sitting at ready: the
+    // panel showed one complete row, no Resume anywhere, and the parts stayed
+    // in the bucket until the reaper. The row is the only thing that knows.
+    const [row] = rehydrate([inFlight])
+
+    expect(row.status).toBe('interrupted')
+    expect(row.versionId).toBe(VERSION_ID)
+    expect(row.uploadId).toBe('u1')
+  })
+
+  it('is failed, not interrupted, when it never got an upload id', () => {
+    // Nothing to come back to: the same rule the upload loop applies when a
+    // transfer breaks before initiate has answered.
+    const [row] = rehydrate([{ ...inFlight, versionId: undefined, uploadId: undefined }])
+
+    expect(row.status).toBe('failed')
+  })
+
+  it('leaves the rows it did not write alone', () => {
+    const rows = rehydrate([
+      { ...inFlight, id: 'a', status: 'interrupted' },
+      { ...inFlight, id: 'b', status: 'failed' },
+      { ...inFlight, id: 'c', status: 'cancelled' },
+    ])
+
+    expect(rows.map((r) => r.status)).toEqual(['interrupted', 'failed', 'cancelled'])
+  })
+
+  it('keeps an in-flight row in storage at all', () => {
+    const opts = (useUploadStore as unknown as {
+      persist: { getOptions: () => { partialize?: (s: unknown) => { files: UploadFile[] } } }
+    }).persist.getOptions()
+    const kept = opts.partialize!({
+      files: [
+        { ...inFlight, id: 'a', status: 'uploading' },
+        { ...inFlight, id: 'b', status: 'processing' },
+        { ...inFlight, id: 'c', status: 'complete' },
+      ],
+    }).files
+
+    expect(kept.map((f) => f.id)).toEqual(['a'])
   })
 })
