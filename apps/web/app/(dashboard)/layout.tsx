@@ -10,6 +10,7 @@ import { CommandPalette } from "@/components/layout/command-palette";
 import { UploadsPanel } from "@/components/layout/uploads-panel";
 import { UploadSSEBridge } from "@/components/layout/upload-sse-bridge";
 import { PoweredByBadge } from "@/components/shared/powered-by-badge";
+import { refuseFileDrag } from "@/lib/drag";
 import { cn } from "@/lib/utils";
 
 export default function DashboardLayout({
@@ -44,7 +45,18 @@ export default function DashboardLayout({
   }, []);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-bg-primary">
+    // The shell refuses a file drag nothing inside it took. Every drop target
+    // stops the event when it accepts, so anything arriving here was wanted by
+    // nobody, and the browser's own handling of it navigates the tab to the
+    // file. The rail, the header and the attribution badge are all siblings of
+    // the page rather than parts of it, and the badge in particular floats over
+    // the asset area a project page offers as a drop target -- releasing a few
+    // pixels off it used to load `file:///...` over the session.
+    <div
+      className="flex h-screen overflow-hidden bg-bg-primary"
+      onDragOver={refuseFileDrag}
+      onDrop={refuseFileDrag}
+    >
       <Sidebar
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((c) => !c)}

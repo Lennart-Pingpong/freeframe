@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 
-import { FolderTree } from '../folder-tree'
+import { FolderTree, PROJECT_ROOT_ROW } from '../folder-tree'
 import type { FolderTreeNode } from '@/types'
 
 const tree: FolderTreeNode[] = [
@@ -204,5 +204,58 @@ describe('what reaches the page behind the tree', () => {
     fireEvent.drop(treeBackground, { dataTransfer: fileDrag() })
 
     expect(onPage).toHaveBeenCalled()
+  })
+})
+
+describe('the project-root row behaves like every other row', () => {
+  const lit = (el: HTMLElement) => el.closest('div')!.className.includes('ring-accent/50')
+
+  it('lights from the shared marking rather than from its own state', () => {
+    // It used to light from a local `isDragOverRoot`, which made it invisible
+    // to the release logic: crossing up from a folder row lit the root at once
+    // while the folder row only scheduled its 90ms guarded release, so both
+    // wore the ring for that window -- the exact thing the guard exists to
+    // prevent.
+    renderTree({ onDropFiles: vi.fn(), fileDragTarget: PROJECT_ROOT_ROW })
+
+    expect(lit(screen.getByText('Season 2'))).toBe(true)
+    expect(lit(screen.getByText('Episodes'))).toBe(false)
+  })
+
+  it('reports its claim upwards instead of keeping it', () => {
+    const onFileDragOverFolder = vi.fn()
+    renderTree({ onDropFiles: vi.fn(), onFileDragOverFolder })
+
+    fireEvent.dragEnter(screen.getByText('Season 2'), { dataTransfer: fileDrag() })
+
+    expect(onFileDragOverFolder).toHaveBeenCalledWith(PROJECT_ROOT_ROW)
+    // Not a folder id: the row means the project root, and `null` is already
+    // spoken for in this channel -- it is what releasing the marking says.
+    expect(onFileDragOverFolder).not.toHaveBeenCalledWith(null)
+  })
+
+  it('names itself when it lets the marking go', () => {
+    const onFileDragOverFolder = vi.fn()
+    renderTree({ onDropFiles: vi.fn(), onFileDragOverFolder })
+
+    const row = screen.getByText('Season 2')
+    fireEvent.dragEnter(row, { dataTransfer: fileDrag() })
+    fireEvent.dragLeave(row, { dataTransfer: fileDrag() })
+
+    expect(onFileDragOverFolder).toHaveBeenLastCalledWith(null, PROJECT_ROOT_ROW)
+  })
+
+  it('does not blink as the pointer crosses its own icon and label', () => {
+    // No depth counter here before, and no check that the drag carried files:
+    // every dragleave raised by a child took the marking down for a frame.
+    const onFileDragOverFolder = vi.fn()
+    renderTree({ onDropFiles: vi.fn(), onFileDragOverFolder })
+
+    const row = screen.getByText('Season 2')
+    fireEvent.dragEnter(row, { dataTransfer: fileDrag() })
+    fireEvent.dragEnter(row, { dataTransfer: fileDrag() }) // onto a child
+    fireEvent.dragLeave(row, { dataTransfer: fileDrag() }) // off that child
+
+    expect(onFileDragOverFolder).not.toHaveBeenCalledWith(null, PROJECT_ROOT_ROW)
   })
 })

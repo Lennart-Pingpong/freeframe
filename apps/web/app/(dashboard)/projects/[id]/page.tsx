@@ -33,7 +33,7 @@ import { Avatar } from "@/components/shared/avatar";
 import { AssetGrid } from "@/components/projects/asset-grid";
 import { CommentPanel } from "@/components/review/comment-panel";
 import { UploadZone } from "@/components/upload/upload-zone";
-import { carriesFiles } from "@/lib/drag";
+import { useFileDropRegion } from "@/components/projects/use-file-drop-region";
 import { useUploadStore } from "@/stores/upload-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useViewStore } from "@/stores/view-store";
@@ -355,159 +355,45 @@ export default function ProjectDetailPage() {
   // empty state -- which is the case that says "Upload your first asset to get
   // started" across an inert rectangle -- accepts a drop too, and so does the
   // blank space below a short row of cards.
-  const dropRegion = React.useRef<HTMLDivElement>(null);
-  const dropDepth = React.useRef(0);
-  const [isFileDragOver, setIsFileDragOver] = React.useState(false);
-  // Which folder the drag is over, if any. A folder is the more specific
-  // target, so the region gives up its own marking while one is lit -- two
-  // frames at once do not say where the file will land.
-  const [fileDragFolderId, setFileDragFolderId] = React.useState<string | null>(null);
-  const folderClearTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Claiming is immediate, releasing is not. The few pixels of gap between two
-  // folder cards belong to the region, so a pointer crossing from one folder to
-  // the next reports "no folder" in between -- and clearing at once makes the
-  // big frame flash on and off in that gap. Any folder claiming the drag
-  // cancels a pending release, so the handover looks like one thing moving.
-  const setFolderTarget = React.useCallback(
-    (folderId: string | null, from?: string) => {
-      if (folderClearTimer.current) {
-        clearTimeout(folderClearTimer.current);
-        folderClearTimer.current = null;
-      }
-      if (folderId !== null) {
-        setFileDragFolderId(folderId);
-        return;
-      }
-      folderClearTimer.current = setTimeout(() => {
-        folderClearTimer.current = null;
-        // Only the folder that still holds the marking may end it. Crossing
-        // from one folder to the next raises the new folder's `dragenter`
-        // BEFORE the old folder's `dragleave`, so the release arriving last
-        // belongs to the folder already left behind -- and acting on it took
-        // the marking off the folder under the pointer and put the whole-area
-        // frame back up beside it.
-        setFileDragFolderId((cur) => (from && cur !== from ? cur : null));
-      }, 90);
-    },
-    [],
-  );
-
-  React.useEffect(
-    () => () => {
-      if (folderClearTimer.current) clearTimeout(folderClearTimer.current);
-    },
-    [],
-  );
+  //
   // Not the trash and not the share-link list: neither can receive an upload,
   // and `canUpload` is owner/editor, so a reviewer never gets an affordance
-  // that ends in a 403. Not while the upload dialog is open either: its
-  // backdrop covers the region and is portalled from inside it, so the drop
-  // bubbles here and passes the release check, starting an upload behind a
-  // dialog that is asking about a different one.
-  const canDropFiles =
-    canUpload && !showTrash && !showShareLinks && !uploadOpen;
+  // that ends in a 403. Whether a dialog is open is deliberately not part of
+  // it; see `useFileDropRegion` for why naming them one by one does not work.
+  const canDropFiles = canUpload && !showTrash && !showShareLinks;
 
-  const handleFileDragEnter = (e: React.DragEvent) => {
-    if (!canDropFiles || !carriesFiles(e)) return;
-    e.preventDefault();
-    // Counted rather than toggled: dragenter and dragleave fire for every child
-    // the pointer crosses, so a boolean flickers off on each card it passes.
-    dropDepth.current += 1;
-    setIsFileDragOver(true);
-  };
+  const startDroppedUploads = React.useCallback(
+    (folderId: string | null, files: File[]) => {
+      files.forEach((file) =>
+        startUpload(
+          file,
+          projectId,
+          // Straight to startUpload rather than through the dialog. Dragging a
+          // file onto the project has already said everything the dialog asks:
+          // which file, which folder, and the name comes from the file. The
+          // single-file rename field is skipped, and renaming afterwards from
+          // the grid covers that.
+          file.name.replace(/\.[^/.]+$/, ""),
+          project?.name,
+          folderId,
+        ),
+      );
+    },
+    [startUpload, projectId, project?.name],
+  );
 
-  const handleFileDragOver = (e: React.DragEvent) => {
-    if (!canDropFiles || !carriesFiles(e)) return;
-    // Without this the browser handles the drop itself and navigates away from
-    // the app to display the file.
-    e.preventDefault();
-    // Taken, so the page-level refusal below does not overwrite the cursor with
-    // "you cannot drop here" over the one place where you can.
-    e.stopPropagation();
-    e.dataTransfer.dropEffect = "copy";
-  };
-
-  // The page as a whole refuses what nothing in it took.
-  //
-  // Every element that accepts a file stops the event, so anything arriving
-  // here was wanted by nobody -- and left alone it goes to the browser, which
-  // navigates the tab to the file and takes the session with it. The two
-  // pixels of gap between two folder rows in the sidebar are enough to lose
-  // the page that way, which is how this was found.
-  const refuseFileDrag = (e: React.DragEvent) => {
-    if (!carriesFiles(e)) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "none";
-  };
-
-  const handleFileDragLeave = (e: React.DragEvent) => {
-    if (!canDropFiles || !carriesFiles(e)) return;
-    dropDepth.current = Math.max(0, dropDepth.current - 1);
-    if (dropDepth.current === 0) {
-      setIsFileDragOver(false);
-      setFolderTarget(null);
-    }
-  };
-
-  const handleFileDrop = (e: React.DragEvent) => {
-    if (!canDropFiles || !carriesFiles(e)) return;
-    // Always, even when the drop is refused below: without it the browser
-    // handles the file itself and navigates away from the app.
-    e.preventDefault();
-    // The rule is what the user sees: the pointer has to be inside the region
-    // when the button comes up. An event reaching this handler is not proof of
-    // that -- a drag can end on a target that is no longer under the pointer --
-    // so the release point is checked against the region itself.
-    const rect = dropRegion.current?.getBoundingClientRect();
-    const released =
-      !rect ||
-      (e.clientX >= rect.left &&
-        e.clientX < rect.right &&
-        e.clientY >= rect.top &&
-        e.clientY < rect.bottom);
-    dropDepth.current = 0;
-    setIsFileDragOver(false);
-    setFolderTarget(null);
-    if (!released) return;
-    // See handleFileDragOver: taken, so the page-level refusal is not also run
-    // for a file this region is about to upload.
-    e.stopPropagation();
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length === 0) return;
-    // Straight to startUpload rather than through the dialog. Dragging a file
-    // onto the project has already said everything the dialog asks: which file,
-    // which folder, and the name comes from the file. The single-file rename
-    // field is skipped, and renaming afterwards from the grid covers that.
-    files.forEach((file) =>
-      startUpload(
-        file,
-        projectId,
-        file.name.replace(/\.[^/.]+$/, ""),
-        project?.name,
-        currentFolderId,
-      ),
-    );
-  };
-
-  // `null` is the project root, which is what the tree's root row reports.
-  const handleDropFilesToFolder = (
-    targetFolderId: string | null,
-    files: File[],
-  ) => {
-    setFolderTarget(null);
-    setIsFileDragOver(false);
-    dropDepth.current = 0;
-    files.forEach((file) =>
-      startUpload(
-        file,
-        projectId,
-        file.name.replace(/\.[^/.]+$/, ""),
-        project?.name,
-        targetFolderId,
-      ),
-    );
-  };
+  const {
+    regionRef: dropRegion,
+    regionProps,
+    showRegionFrame,
+    fileDragTarget: fileDragFolderId,
+    setFolderTarget,
+    onDropToFolder: handleDropFilesToFolder,
+  } = useFileDropRegion({
+    enabled: canDropFiles,
+    currentFolderId,
+    onUploadFiles: startDroppedUploads,
+  });
 
   const handleStartUpload = () => {
     pendingFiles.forEach((file) => {
@@ -537,11 +423,10 @@ export default function ProjectDetailPage() {
   );
 
   return (
-    <div
-      className="flex h-full flex-col lg:flex-row overflow-hidden"
-      onDragOver={refuseFileDrag}
-      onDrop={refuseFileDrag}
-    >
+    // No refusal handler here: it lives on the dashboard shell, which wraps
+    // this page along with the header, the rail and the attribution badge --
+    // all of which are outside this element and were still losing the tab.
+    <div className="flex h-full flex-col lg:flex-row overflow-hidden">
       {/* ─── Left Sidebar (Frame.io style) ──────────────────────────────── */}
       <div className="hidden lg:flex w-72 flex-col border-r border-border bg-bg-secondary shrink-0">
         {/* Assets section */}
@@ -591,8 +476,12 @@ export default function ProjectDetailPage() {
               mutateAssets();
               mutateSubfolders();
             }}
-            onDropFiles={canDropFiles ? handleDropFilesToFolder : undefined}
-            onFileDragOverFolder={canDropFiles ? setFolderTarget : undefined}
+            // `canUpload`, not `canDropFiles`. What the main pane is showing
+            // says nothing about the sidebar: a folder row means "upload into
+            // this folder" while the trash or the share-link list is open just
+            // as much as it does beside the grid. Only the permission applies.
+            onDropFiles={canUpload ? handleDropFilesToFolder : undefined}
+            onFileDragOverFolder={canUpload ? setFolderTarget : undefined}
             fileDragTarget={fileDragFolderId}
             onDropItems={async (targetFolderId, assetIds, folderIds) => {
               await bulkMove(assetIds, folderIds, targetFolderId);
@@ -765,10 +654,7 @@ export default function ProjectDetailPage() {
       <div
         ref={dropRegion}
         className="relative flex-1 flex min-w-0 h-full"
-        onDragEnter={handleFileDragEnter}
-        onDragOver={handleFileDragOver}
-        onDragLeave={handleFileDragLeave}
-        onDrop={handleFileDrop}
+        {...regionProps}
       >
       <div
         className="flex-1 flex flex-col min-w-0 bg-bg-primary h-full overflow-y-auto"
@@ -1097,7 +983,7 @@ export default function ProjectDetailPage() {
           </Dialog.Root>
         </div>
       </div>
-      {isFileDragOver && !fileDragFolderId && (
+      {showRegionFrame && (
         // pointer-events-none is load-bearing: an overlay that takes the
         // pointer swallows the dragleave and the drop underneath it, so the
         // marking would stick and the drop would never arrive.
