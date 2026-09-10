@@ -208,7 +208,7 @@ function CommentMarker({
   return (
     <div
       ref={markerRef}
-      className="absolute top-0 -translate-x-1/2 cursor-pointer"
+      className="absolute top-0 -translate-x-1/2 cursor-pointer pointer-events-auto"
       style={{ left: `${leftPercent}%` }}
       onMouseEnter={onHover}
       onMouseLeave={onLeave}
@@ -280,6 +280,7 @@ export function ProgressBar({
   className,
 }: ProgressBarProps) {
   const trackRef = useRef<HTMLDivElement>(null)
+  const activePointerIdRef = useRef<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const [hoverX, setHoverX] = useState(0)
@@ -307,14 +308,29 @@ export function ProgressBar({
     [duration],
   )
 
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
+  const endDrag = useCallback(() => {
+    activePointerIdRef.current = null
+    setIsDragging(false)
+    setHoverTime(null)
+    clearPreview()
+  }, [clearPreview])
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      // While dragging, only the pointer that started the drag may drive it —
+      // otherwise a second finger (e.g. a two-handed grip) would hijack the seek.
+      if (isDragging && e.pointerId !== activePointerIdRef.current) return
       const time = getTimeFromEvent(e.clientX)
       setHoverTime(time)
       const track = trackRef.current
       if (track) {
         const rect = track.getBoundingClientRect()
-        setHoverX(e.clientX - rect.left)
+        // Clamped to the track's own width — without this, a captured drag
+        // (which keeps delivering pointermove past the track's edges) pushes
+        // the floating frame-preview/timecode tooltip past the player's own
+        // bounds, e.g. off the left edge and over the comment panel, even
+        // though the seek itself is already clamped via getTimeFromEvent.
+        setHoverX(Math.max(0, Math.min(rect.width, e.clientX - rect.left)))
       }
       if (isDragging) {
         onSeek(time)
@@ -324,44 +340,54 @@ export function ProgressBar({
     [isDragging, getTimeFromEvent, onSeek, seekPreview],
   )
 
-  const handleMouseLeave = useCallback(() => {
+  const handlePointerLeave = useCallback(() => {
     if (!isDragging) {
       setHoverTime(null)
       clearPreview()
     }
   }, [isDragging, clearPreview])
 
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      e.preventDefault()
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!e.isPrimary || e.button !== 0) return // ignore a secondary pointer or a non-primary button (e.g. right-click)
+      if (activePointerIdRef.current !== null) return // a drag is already in progress
+      activePointerIdRef.current = e.pointerId
+      // Pointer capture keeps this element receiving move/up/cancel for this
+      // pointer even once it's dragged outside the track's own bounds, so no
+      // window-level listeners are needed for drag-outside-track. Optional
+      // chaining: not implemented in jsdom (tests don't cover the capture
+      // path itself). Without it, pointerup lands wherever the pointer
+      // physically is, not necessarily on the track — so endDrag may not
+      // fire there and the drag then only ends via onLostPointerCapture,
+      // which a browser without capture support also won't fire. On a real
+      // browser (every one that matters for this fix) capture is always
+      // available, so this only matters for the test environment.
+      e.currentTarget.setPointerCapture?.(e.pointerId)
       setIsDragging(true)
       onSeek(getTimeFromEvent(e.clientX))
     },
     [getTimeFromEvent, onSeek],
   )
 
-  // Global mouse up / move to handle drag outside track
-  useEffect(() => {
-    if (!isDragging) return
-
-    const handleGlobalMouseMove = (e: MouseEvent) => {
+  const handlePointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.pointerId !== activePointerIdRef.current) return
       onSeek(getTimeFromEvent(e.clientX))
-    }
+      endDrag()
+    },
+    [getTimeFromEvent, onSeek, endDrag],
+  )
 
-    const handleGlobalMouseUp = (e: MouseEvent) => {
-      setIsDragging(false)
-      setHoverTime(null)
-      clearPreview()
-      onSeek(getTimeFromEvent(e.clientX))
-    }
-
-    window.addEventListener('mousemove', handleGlobalMouseMove)
-    window.addEventListener('mouseup', handleGlobalMouseUp)
-    return () => {
-      window.removeEventListener('mousemove', handleGlobalMouseMove)
-      window.removeEventListener('mouseup', handleGlobalMouseUp)
-    }
-  }, [isDragging, getTimeFromEvent, onSeek, clearPreview])
+  const handlePointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      // iOS fires this instead of pointerup when the system takes the gesture
+      // (a second finger starting a pinch, an edge swipe, a long-press callout).
+      // Must still end the drag, or every later pointer move on the page seeks.
+      if (e.pointerId !== activePointerIdRef.current) return
+      endDrag()
+    },
+    [endDrag],
+  )
 
   // Separate timecoded comments
   const pointMarkers = comments.filter(
@@ -376,14 +402,32 @@ export function ProgressBar({
 
   return (
     <div className={cn('relative flex flex-col w-full group/progress py-1', className)}>
-      {/* Track area */}
+      {/* Track — handlers live here (as upstream), so the invisible hit-area
+          extension below can be a plain overflowing child: touches/clicks on it
+          bubble up to this element without adding to layout height. */}
       <div
         ref={trackRef}
-        className="relative w-full h-1 group-hover/progress:h-1.5 transition-all duration-150 cursor-pointer bg-border rounded-full"
-        onMouseMove={handleMouseMove}
-        onMouseLeave={handleMouseLeave}
-        onMouseDown={handleMouseDown}
+        data-testid="progress-bar-track"
+        className="relative w-full h-1 group-hover/progress:h-1.5 transition-all duration-150 cursor-pointer touch-none bg-border rounded-full"
+        onPointerMove={handlePointerMove}
+        onPointerLeave={handlePointerLeave}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+        onLostPointerCapture={endDrag}
       >
+        {/* Invisible hit-area extension — no handlers of its own. It overflows
+            above/below the thin visual track (out of flow, so it doesn't affect
+            layout height) purely to widen the touch/click target. Deliberately
+            asymmetric: `-top-1` stays inside this component's own `py-1` root
+            padding, so it never reaches into the video area rendered directly
+            above (this component has no padding of its own to spare above the
+            track — going further up paints over the video, intercepting clicks
+            and, in drawing mode, strokes meant for the annotation canvas).
+            `-bottom-3.5` clears the root's bottom padding and lands in the
+            transport bar's own button gutter below, which does have room. */}
+        <div className="absolute -top-1 -bottom-3.5 inset-x-0" />
+
         {/* Buffered range */}
         <div
           className="absolute inset-y-0 left-0 bg-border-secondary rounded-full"
@@ -418,14 +462,18 @@ export function ProgressBar({
 
         {/* Playhead thumb */}
         <div
-          className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-accent shadow-lg opacity-0 group-hover/progress:opacity-100 transition-opacity pointer-events-none z-10"
+          className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-accent shadow-lg opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/progress:opacity-100 transition-opacity pointer-events-none z-10"
           style={{ left: `${playPercent}%`, transform: 'translateX(-50%) translateY(-50%)' }}
         />
       </div>
 
-      {/* Comment markers row — below the progress bar */}
+      {/* Comment markers row — below the progress bar. pointer-events-none
+          on the row itself (with pointer-events-auto on each marker) so this
+          row's own empty space doesn't swallow the track's hit-area overlap
+          above it — the row was intercepting up to 8 of the overlay's 10
+          downward pixels on any asset with a point comment. */}
       {pointMarkers.length > 0 && (
-        <div className="relative w-full h-6 mt-0.5">
+        <div className="relative w-full h-6 mt-0.5 pointer-events-none">
           {pointMarkers.map((c, idx) => {
             if (c.timecode_start === null) return null
             const left = timeToPercent(c.timecode_start)
@@ -457,6 +505,7 @@ export function ProgressBar({
       {/* Frame preview + time tooltip on bar hover */}
       {hoverTime !== null && (
         <div
+          data-testid="progress-bar-hover-tooltip"
           className="absolute -top-2 z-30 pointer-events-none"
           style={{ left: hoverX, transform: 'translateX(-50%) translateY(-100%)' }}
         >

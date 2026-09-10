@@ -53,7 +53,7 @@ export default function DashboardLayout({
     // the asset area a project page offers as a drop target -- releasing a few
     // pixels off it used to load `file:///...` over the session.
     <div
-      className="flex h-screen overflow-hidden bg-bg-primary"
+      className="flex h-dvh overflow-hidden bg-bg-primary pl-safe pr-safe"
       onDragOver={refuseFileDrag}
       onDrop={refuseFileDrag}
     >
@@ -78,7 +78,7 @@ export default function DashboardLayout({
           so it stays put whether the rail is collapsed or expanded and doesn't
           compete with the org name for the 48px logo header. Renders nothing
           when an admin turns "Powered by FreeFrame" off. */}
-      <PoweredByBadge className="fixed bottom-4 right-4 z-20 rounded-full border border-border bg-bg-elevated/90 px-3 py-1.5 shadow-lg backdrop-blur-sm" />
+      <PoweredByBadge className="fixed bottom-safe right-safe [--ff-bottom:1rem] [--ff-right:1rem] z-20 rounded-full border border-border bg-bg-elevated/90 px-3 py-1.5 shadow-lg backdrop-blur-sm" />
 
       <UploadsPanel />
       <UploadSSEBridge />
