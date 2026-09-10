@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Ban,
   Cog,
+  Pencil,
 } from 'lucide-react'
 import { cn, formatBytes, formatRelativeTime } from '@/lib/utils'
 import { useUploadStore, type UploadFile, type UploadStatus } from '@/stores/upload-store'
@@ -83,10 +84,114 @@ function StatusBadge({ status }: { status: UploadStatus }) {
   }
 }
 
+// ─── Asset name ───────────────────────────────────────────────────────────────
+
+/**
+ * The asset name, editable in place.
+ *
+ * The name is decided in the dialog before a byte moves, which is the one
+ * moment the file is not yet on screen next to it -- and a file dropped
+ * straight onto a folder skips that dialog entirely, so the name is whatever
+ * the camera or the NLE called the file. This is where it can be corrected:
+ * `asset_id` is known as soon as `/upload/initiate` answers, long before the
+ * transfer ends, and `/upload/complete` does not write the name again, so a
+ * rename at 40% survives the upload it is riding on.
+ */
+function UploadName({
+  upload,
+  onError,
+}: {
+  upload: UploadFile
+  /** Reported upwards rather than shown here: the name sits in a flex row
+   *  beside the status badge, and the row already has a line for errors. */
+  onError: (message: string | null) => void
+}) {
+  const renameUpload = useUploadStore((s) => s.renameUpload)
+  const canRename = Boolean(upload.assetId) && !upload.fromHistory
+
+  const [editing, setEditing] = React.useState(false)
+  const [draft, setDraft] = React.useState(upload.assetName)
+  // Guards the cancel path only. Whether removing a focused element raises a
+  // blur on the way out is browser-dependent, and one arriving after Escape
+  // would save the draft Escape just refused. The save path needs no guard:
+  // the store's own "nothing changed" check makes a second commit of the same
+  // draft a no-op, because the first one already wrote it.
+  const settled = React.useRef(false)
+
+  const open = () => {
+    setDraft(upload.assetName)
+    onError(null)
+    settled.current = false
+    setEditing(true)
+  }
+
+  const commit = async () => {
+    if (settled.current) return
+    settled.current = true
+    setEditing(false)
+    onError(await renameUpload(upload.id, draft))
+  }
+
+  const cancel = () => {
+    settled.current = true
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <input
+        className="flex-1 min-w-0 bg-transparent border-b border-accent outline-none text-sm font-medium text-text-primary px-0.5"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void commit()
+          if (e.key === 'Escape') cancel()
+        }}
+        aria-label="Asset name"
+        autoFocus
+      />
+    )
+  }
+
+  if (!canRename) {
+    return (
+      <p className="text-sm font-medium text-text-primary truncate flex-1">
+        {upload.assetName}
+      </p>
+    )
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={open}
+        title="Rename"
+        className="text-sm font-medium text-text-primary truncate flex-1 text-left hover:underline decoration-dotted underline-offset-2"
+      >
+        {upload.assetName}
+      </button>
+      {/* The name is clickable on its own, but nothing about a line of text
+          says so. The pencil is the part that can be seen. */}
+      <button
+        type="button"
+        onClick={open}
+        title="Rename"
+        aria-label={`Rename ${upload.assetName}`}
+        className="shrink-0 h-5 w-5 flex items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+      >
+        <Pencil className="h-3 w-3" />
+      </button>
+    </>
+  )
+}
+
 // ─── Upload Item ──────────────────────────────────────────────────────────────
 
 function UploadItem({ upload }: { upload: UploadFile }) {
   const { cancelUpload, removeFile } = useUploadStore()
+  const [renameError, setRenameError] = React.useState<string | null>(null)
   const isUploading = upload.status === 'pending' || upload.status === 'uploading'
   const isProcessing = upload.status === 'processing'
   const showProgress = isUploading || isProcessing
@@ -103,7 +208,7 @@ function UploadItem({ upload }: { upload: UploadFile }) {
       {/* Info */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <p className="text-sm font-medium text-text-primary truncate flex-1">{upload.assetName}</p>
+          <UploadName upload={upload} onError={setRenameError} />
           <StatusBadge status={upload.status} />
         </div>
         <p className="text-xs text-text-tertiary truncate mt-0.5">
@@ -142,6 +247,11 @@ function UploadItem({ upload }: { upload: UploadFile }) {
           )}
           {upload.status === 'failed' && upload.error && (
             <span className="text-[11px] text-status-error truncate">{upload.error}</span>
+          )}
+          {/* The name has already snapped back by the time this shows, which
+              says something went wrong but not what. */}
+          {renameError && (
+            <span className="text-[11px] text-status-error truncate">{renameError}</span>
           )}
         </div>
       </div>
