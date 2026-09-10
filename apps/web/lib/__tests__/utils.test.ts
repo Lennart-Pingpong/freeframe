@@ -9,6 +9,7 @@ import {
   storageMeterState,
   gbToBytes,
   bytesToGb,
+  assetNameFromFile,
 } from '../utils'
 
 describe('formatTime', () => {
@@ -163,5 +164,31 @@ describe('GB conversion', () => {
   })
   it('bytesToGb is the inverse', () => {
     expect(bytesToGb(10 * 1024 ** 3)).toBe(10)
+  })
+})
+
+describe('assetNameFromFile', () => {
+  it('drops the extension', () => {
+    expect(assetNameFromFile('A047C012_230815_R1AB.mov')).toBe('A047C012_230815_R1AB')
+  })
+
+  it('drops only the last one', () => {
+    // `archive.tar` is what a person would call this, and it is what the
+    // single-file path has always produced.
+    expect(assetNameFromFile('rushes.tar.gz')).toBe('rushes.tar')
+  })
+
+  it('leaves a name that has no extension', () => {
+    expect(assetNameFromFile('Rushes')).toBe('Rushes')
+  })
+
+  it('keeps a name that is nothing but an extension', () => {
+    // Stripping it would leave an asset called "", which is worse than a
+    // dotfile name nobody meant to upload in the first place.
+    expect(assetNameFromFile('.gitignore')).toBe('.gitignore')
+  })
+
+  it('keeps a dot that is part of the name', () => {
+    expect(assetNameFromFile('Ep04 v2.1 final.mov')).toBe('Ep04 v2.1 final')
   })
 })

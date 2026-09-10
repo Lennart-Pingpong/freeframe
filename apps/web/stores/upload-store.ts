@@ -1,5 +1,6 @@
 import { create, type StateCreator } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { mutate as globalMutate } from 'swr'
 import { api } from '@/lib/api'
 import type { AssetResponse } from '@/types'
 
@@ -335,6 +336,16 @@ export interface UploadFile {
   versionId?: string
   uploadId?: string
   createdAt: number // timestamp for grouping
+  /**
+   * True for a row rebuilt from `/me/assets` rather than started here.
+   *
+   * That endpoint spans every project the user can see, in whatever role they
+   * hold there, so a history row is not proof of the `editor` role that
+   * renaming needs -- a reviewer's own history is full of assets they cannot
+   * touch. A row this session started is proof, because starting it required
+   * the same role.
+   */
+  fromHistory?: boolean
 }
 
 interface InitiateResponse {
@@ -366,6 +377,9 @@ interface UploadStore {
   startUpload: (file: File, projectId: string, assetName: string, projectName?: string, folderId?: string | null) => string
   startVersionUpload: (file: File, assetId: string, assetName: string, projectId: string) => string
   cancelUpload: (fileId: string) => void
+  /** Rename the asset a row is uploading. Resolves to an error message, or
+   *  null when the new name is stored. */
+  renameUpload: (fileId: string, name: string) => Promise<string | null>
   removeFile: (fileId: string) => void
   clearCompleted: () => void
   fetchHistory: () => Promise<void>
@@ -442,6 +456,7 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
         assetId: a.id,
         versionId: v.id,
         createdAt: new Date(v.created_at).getTime(),
+        fromHistory: true,
       }
     })
   return [...existing, ...newFiles]
@@ -702,6 +717,51 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         f.id === fileId ? { ...f, status: 'cancelled' as const, progress: 0 } : f,
       ),
     }))
+  },
+
+  renameUpload: async (fileId, name) => {
+    const row = get().files.find((f) => f.id === fileId)
+    if (!row) return null
+    const trimmed = name.trim()
+    if (!trimmed || trimmed === row.assetName) return null
+
+    // Two rows cannot be renamed, and both look renameable from the outside.
+    //
+    // A queued row has no asset yet: `/upload/initiate` is what creates it and
+    // returns the id, and until it answers there is nothing on the server to
+    // rename. Editing the row alone would appear to work and write nothing.
+    //
+    // A history row has an asset, but it came from `/me/assets` -- see
+    // `fromHistory`. Offering the edit and answering 403 is worse than not
+    // offering it.
+    if (row.fromHistory || !row.assetId) return null
+
+    const previous = row.assetName
+    const applyName = (value: string) =>
+      set((s) => ({
+        files: s.files.map((f) => (f.id === fileId ? { ...f, assetName: value } : f)),
+      }))
+
+    // Optimistic. The user has just left a text field; putting the old name
+    // back for the length of a round trip reads as the edit having failed.
+    applyName(trimmed)
+    try {
+      await api.patch(`/assets/${row.assetId}`, { name: trimmed })
+    } catch (err) {
+      applyName(previous)
+      return err instanceof Error ? err.message : 'Rename failed'
+    }
+
+    // The panel is mounted in the dashboard layout, so it has no handle on the
+    // grid it is floating over and no way to tell it the name changed. Every
+    // asset list is keyed by a path containing `/assets`, so revalidating that
+    // set is what makes the card behind the panel agree with the row in it.
+    void globalMutate(
+      (key) => typeof key === 'string' && key.includes('/assets'),
+      undefined,
+      { revalidate: true },
+    )
+    return null
   },
 
   removeFile: (fileId) => {

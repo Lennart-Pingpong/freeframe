@@ -25,7 +25,12 @@ import {
   ExternalLink,
   Users,
 } from "lucide-react";
-import { cn, formatRelativeTime, formatBytes } from "@/lib/utils";
+import {
+  cn,
+  formatRelativeTime,
+  formatBytes,
+  assetNameFromFile,
+} from "@/lib/utils";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -345,13 +350,15 @@ export default function ProjectDetailPage() {
 
   const handleFilesSelected = (files: File[]) => {
     setPendingFiles(files);
-    if (files.length > 0) setAssetName(files[0].name.replace(/\.[^/.]+$/, ""));
+    if (files.length > 0) setAssetName(assetNameFromFile(files[0].name));
   };
 
   const handleStartUpload = () => {
     pendingFiles.forEach((file) => {
       const name =
-        pendingFiles.length === 1 ? assetName || file.name : file.name;
+        pendingFiles.length === 1
+          ? assetName || assetNameFromFile(file.name)
+          : assetNameFromFile(file.name);
       // Note: startUpload does not yet accept folderId — assets will upload to root.
       // Upload store needs to be updated in a future task to support folder placement.
       startUpload(file, projectId, name, project?.name, currentFolderId);
