@@ -125,23 +125,30 @@ describe('renaming a row that is uploading', () => {
   })
 })
 
-describe('rows that may not be renamed', () => {
+describe('renaming a row that has not reached the server yet', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     seed()
   })
 
-  it('a queued row, which has no asset yet', async () => {
+  it('renames the row without a request, because there is no asset yet', async () => {
     // `/upload/initiate` is what creates the asset and hands back its id.
-    // Before it answers there is nothing on the server to rename, and editing
-    // the row alone would appear to work and write nothing.
+    // Until it answers, the row is the only record of the name -- and it is
+    // the record initiate reads, so nothing is lost by keeping it here.
     seed(row({ status: 'pending', assetId: undefined }))
 
     const error = await useUploadStore.getState().renameUpload('row-1', 'Ep04')
 
     expect(error).toBeNull()
     expect(api.patch).not.toHaveBeenCalled()
-    expect(names()).toEqual(['A047C012_230815_R1AB'])
+    expect(names()).toEqual(['Ep04'])
+  })
+})
+
+describe('rows that may not be renamed', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    seed()
   })
 
   it('a history row, which is not proof of the role the rename needs', async () => {
