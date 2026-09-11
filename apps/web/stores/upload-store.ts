@@ -515,11 +515,16 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       try {
         updateFile(id, { status: 'uploading' })
 
+        // What the asset will be called. This body runs synchronously until the
+        // first await, so initiate is dispatched in the same tick as the row is
+        // created: there is no instant in between for anyone to rename it.
+        const sentName = assetName
+
         const initRes = await api.post<InitiateResponse>(
           '/upload/initiate',
           {
             project_id: projectId,
-            asset_name: assetName,
+            asset_name: sentName,
             original_filename: file.name,
             file_size_bytes: file.size,
             mime_type: file.type,
@@ -532,6 +537,20 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         asset_id = initRes.asset_id
 
         updateFile(id, { uploadId: upload_id, assetId: asset_id, versionId: version_id })
+
+        // The round trip is the window that does exist, and the only place a
+        // rename can be lost: the panel offers the pencil from the moment the
+        // row appears, so an edit during it went into the row while the request
+        // carrying the old name had already left. Now that the asset exists it
+        // can be told. Failing here must not fail the upload -- the bytes are
+        // the point, and the name is a correction the user can make again.
+        const nameAfterInitiate =
+          get().files.find((f) => f.id === id)?.assetName ?? sentName
+        if (nameAfterInitiate !== sentName) {
+          await api
+            .patch(`/assets/${asset_id}`, { name: nameAfterInitiate })
+            .catch(() => undefined)
+        }
 
         const parts = await uploadAllParts(file, s3_key, upload_id, controller, (percent) =>
           updateFile(id, { progress: percent }),
@@ -725,16 +744,10 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     const trimmed = name.trim()
     if (!trimmed || trimmed === row.assetName) return null
 
-    // Two rows cannot be renamed, and both look renameable from the outside.
-    //
-    // A queued row has no asset yet: `/upload/initiate` is what creates it and
-    // returns the id, and until it answers there is nothing on the server to
-    // rename. Editing the row alone would appear to work and write nothing.
-    //
-    // A history row has an asset, but it came from `/me/assets` -- see
-    // `fromHistory`. Offering the edit and answering 403 is worse than not
-    // offering it.
-    if (row.fromHistory || !row.assetId) return null
+    // A history row cannot be renamed: it came from `/me/assets` -- see
+    // `fromHistory` -- so it is not proof of the role the edit needs, and
+    // offering it only to answer 403 is worse than not offering it.
+    if (row.fromHistory) return null
 
     const previous = row.assetName
     const applyName = (value: string) =>
@@ -745,6 +758,12 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     // Optimistic. The user has just left a text field; putting the old name
     // back for the length of a round trip reads as the edit having failed.
     applyName(trimmed)
+
+    // No asset yet, because `/upload/initiate` is what creates one. The row is
+    // the only record of the name until it answers, and it is the record
+    // initiate reads -- so this is stored, just not on the server yet.
+    if (!row.assetId) return null
+
     try {
       await api.patch(`/assets/${row.assetId}`, { name: trimmed })
     } catch (err) {
