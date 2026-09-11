@@ -3,6 +3,17 @@
  * pencil beside it is the part that says so.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+// Leaving the Active tab switches on the panel's infinite scroll, which jsdom
+// has no implementation for.
+vi.stubGlobal(
+  'IntersectionObserver',
+  class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  },
+)
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 
 vi.mock('@/lib/api', () => ({
@@ -123,19 +134,38 @@ describe('renaming from the uploads panel', () => {
   })
 })
 
+describe('a row that has not reached the server yet', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('is offered the rename as well', () => {
+    // The pencil is there from the moment the row appears. There is no asset
+    // to PATCH while it says "Queued", but the row is what initiate reads for
+    // the name, so the edit is not lost -- it is just not a request yet.
+    open(row({ status: 'pending', assetId: undefined }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rename A047C012' }))
+    fireEvent.change(field(), { target: { value: 'Ep04' } })
+    fireEvent.keyDown(field(), { key: 'Enter' })
+
+    expect(screen.getByRole('button', { name: 'Ep04' })).toBeTruthy()
+    expect(api.patch).not.toHaveBeenCalled()
+  })
+})
+
 describe('rows the panel does not offer a rename on', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('a queued row, which has no asset to rename yet', () => {
-    open(row({ status: 'pending', assetId: undefined }))
-
-    expect(screen.queryByRole('button', { name: 'Rename A047C012' })).toBeNull()
-    expect(screen.getByText('A047C012')).toBeTruthy()
-  })
-
   it('a history row, which may belong to a project the user only reviews', () => {
+    // `/me/assets` is not "my uploads": with no filter it returns every asset
+    // in every project the user is a member of, in whatever role, plus
+    // anything merely shared or assigned to them. Most of that list is not
+    // theirs to rename.
     open(row({ id: 'history-a1', fromHistory: true, status: 'complete' }))
+    // A completed row is not on the Active tab the panel opens on, and a
+    // control cannot be absent from a row that was never rendered.
+    fireEvent.click(screen.getByRole('button', { name: /Complete/ }))
 
+    expect(screen.getByText('A047C012')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Rename A047C012' })).toBeNull()
   })
 })

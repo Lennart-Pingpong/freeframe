@@ -106,7 +106,10 @@ function UploadName({
   onError: (message: string | null) => void
 }) {
   const renameUpload = useUploadStore((s) => s.renameUpload)
-  const canRename = Boolean(upload.assetId) && !upload.fromHistory
+  // Offered before the asset exists too: the row is what `/upload/initiate`
+  // reads for the name, so an edit made while it still says "Queued" is
+  // carried into the asset it creates rather than being dropped.
+  const canRename = !upload.fromHistory
 
   const [editing, setEditing] = React.useState(false)
   const [draft, setDraft] = React.useState(upload.assetName)
