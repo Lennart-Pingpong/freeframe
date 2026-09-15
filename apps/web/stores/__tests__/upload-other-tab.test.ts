@@ -97,6 +97,25 @@ describe('a stored in-flight row, judged by the tab that loads it', () => {
     expect(loaded.status).toBe('interrupted')
   })
 
+  it('stays a running upload when it came from history, which has no upload id', () => {
+    // Found by driving two tabs in a real browser: the history row for a
+    // running upload was stored as Elsewhere, and the next tab to load it
+    // turned it into "Failed -- Upload interrupted", with no way to resume.
+    const [loaded] = rehydrate([
+      row({ id: 'history-asset-1', status: 'elsewhere', uploadId: undefined, elsewhereUntil: Date.now() + 60_000 }),
+    ])
+
+    expect(loaded.status).toBe('elsewhere')
+  })
+
+  it('offers it as interrupted once the window it was held for has passed', () => {
+    const [loaded] = rehydrate([
+      row({ id: 'history-asset-1', status: 'elsewhere', uploadId: undefined, elsewhereUntil: Date.now() - 1 }),
+    ])
+
+    expect(loaded.status).toBe('interrupted')
+  })
+
   it('is still failed when it never got an upload id', () => {
     const [loaded] = rehydrate([
       row({ ownerTab: OTHER_TAB, heartbeatAt: Date.now(), versionId: undefined, uploadId: undefined }),
