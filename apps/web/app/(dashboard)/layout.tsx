@@ -90,7 +90,7 @@ export default function DashboardLayout({
         <PoweredByBadge className="fixed bottom-safe right-safe [--ff-bottom:1rem] [--ff-right:1rem] z-20 rounded-full border border-border bg-bg-elevated/90 px-3 py-1.5 shadow-lg backdrop-blur-sm" />
       )}
 
-      <UploadsPanel />
+      <UploadsPanel railCollapsed={sidebarCollapsed} />
       <UploadSSEBridge />
       <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
     </div>
