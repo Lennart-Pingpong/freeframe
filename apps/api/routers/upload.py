@@ -753,6 +753,18 @@ def _trigger_processing(asset_id: uuid.UUID, version_id: uuid.UUID):
     send_task_safe(process_asset, str(asset_id), str(version_id))
 
 
+def _may_remove_asset(db: Session, asset_id: uuid.UUID, user: User) -> bool:
+    """Whether `user` holds the role that deleting this asset requires."""
+    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    if asset is None:
+        return False
+    try:
+        require_project_role(db, asset.project_id, user, ProjectRole.editor)
+    except HTTPException:
+        return False
+    return True
+
+
 @router.post("/abort", status_code=status.HTTP_204_NO_CONTENT)
 def abort_upload(
     body: AbortUploadRequest,
@@ -804,16 +816,52 @@ def abort_upload(
     # the assembled branch below would publish the upload the button exists to
     # throw away. Only an upload still in progress can be discarded: the flag must
     # not become a way to delete a version that already landed.
-    if body.discard and version.processing_status == ProcessingStatus.uploading:
+    if body.discard:
+        # Re-read before trusting that status. `version` was loaded before the
+        # abort above, which is a blocking round trip to storage, and a
+        # `/upload/complete` committing `processing` in that window is invisible
+        # to this transaction under READ COMMITTED. Deciding on the stale value
+        # would delete the assembled master of a version whose transcode has just
+        # been dispatched. The lock holds a concurrent complete off until this
+        # commits; `populate_existing` is what makes the re-read land on the
+        # object rather than only in the SELECT. Same shape as
+        # `_lock_if_still_purgeable` in the cleanup tasks.
+        version = (
+            db.query(AssetVersion)
+            .filter(AssetVersion.id == body.version_id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+        if version is None:
+            raise HTTPException(status_code=404, detail="Version not found")
+
+    if (
+        body.discard
+        and version.deleted_at is None
+        and version.processing_status == ProcessingStatus.uploading
+    ):
         from ..tasks.cleanup_tasks import (
             _dispose_version_files, _strip_asset_with_no_versions,
         )
         asset_id = version.asset_id
         _dispose_version_files(db, version)
         db.flush()
-        _strip_asset_with_no_versions(db, asset_id)
+        # Removing the asset is authorized the way deleting an asset is
+        # everywhere else, by a live role on the project. `created_by` only says
+        # who started the upload, and survives that person being taken off the
+        # project. Without the role the version still goes, since it is theirs,
+        # and an asset left with no versions is the reaper's to collect.
+        stripped = (
+            _may_remove_asset(db, asset_id, current_user)
+            and _strip_asset_with_no_versions(db, asset_id)
+        )
         db.commit()
-        logger.info("upload %s discarded on request", version.id)
+        logger.info(
+            "upload %s discarded by user %s; asset %s %s",
+            version.id, current_user.id, asset_id,
+            "removed with it" if stripped else "kept",
+        )
         return
 
     # Only an upload still in progress is resolved here. The client fires this from
