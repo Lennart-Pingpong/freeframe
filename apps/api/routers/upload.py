@@ -5,7 +5,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from ..database import get_db
 from ..middleware.auth import get_current_user
 from ..models.user import User
@@ -282,6 +282,11 @@ def _held_part_numbers(stored: list[dict], chunk_size: int, total_bytes: int) ->
     return sorted(held)
 
 
+# At least as long as the web client's `LIVE_WINDOW_MS`: every request the
+# client refuses on activity has to be one that did not record any.
+RESUME_TOUCH_INTERVAL = timedelta(minutes=5)
+
+
 @router.get("/{version_id}/parts", response_model=ResumeUploadResponse)
 def list_held_parts(
     version_id: uuid.UUID,
@@ -378,8 +383,17 @@ def list_held_parts(
 
     # Same proof of life presign-part records. Asking to resume is activity, and
     # without this a resume started just inside the reaper's window races it.
-    version.last_activity_at = datetime.now(timezone.utc)
-    db.commit()
+    #
+    # Only when nothing has happened for a while, though. The client reads
+    # `last_activity_at` to refuse touching an upload that moved within the last
+    # few minutes, and a refused request that recorded itself as activity would
+    # refuse the next attempt too, and the one after -- an upload that could
+    # never be resumed for as long as someone kept trying. The reaper's window
+    # is hours, so an upload that moved minutes ago needs no help from here.
+    now = datetime.now(timezone.utc)
+    if previous_activity is None or now - previous_activity >= RESUME_TOUCH_INTERVAL:
+        version.last_activity_at = now
+        db.commit()
 
     return ResumeUploadResponse(
         state="resumable",

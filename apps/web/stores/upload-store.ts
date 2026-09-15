@@ -96,8 +96,15 @@ function storedHeartbeat(fileId: string): number | undefined {
  *  is still sending its own. */
 function activeElsewhere(row: UploadFile, info: ResumeInfo, now: number): boolean {
   if (row.ownerTab === currentTabId()) return false
-  if (!info.last_activity_at) return false
-  return now - Date.parse(info.last_activity_at) < LIVE_WINDOW_MS
+  const until = liveUntil(info.last_activity_at)
+  return until !== undefined && now < until
+}
+
+/** Until when an upload that last moved at `lastActivity` counts as running. */
+function liveUntil(lastActivity: string | null | undefined): number | undefined {
+  if (!lastActivity) return undefined
+  const at = Date.parse(lastActivity)
+  return Number.isNaN(at) ? undefined : at + LIVE_WINDOW_MS
 }
 
 const ELSEWHERE_MESSAGE = 'Still uploading in another tab or on another device'
@@ -523,7 +530,12 @@ const abortControllers: Record<string, AbortController> = {}
 
 /** Claims a row for this tab and keeps stamping it until the returned stop is
  *  called. Written through the store, so it reaches shared storage the same way
- *  progress does. */
+ *  progress does.
+ *
+ *  Every finished part stamps the row as well. A hidden tab's timers are held
+ *  to about once a minute while its requests are not, so on the timer alone
+ *  the stamp fell behind the transfer, and another tab took a live upload for
+ *  a stopped one before the server did. */
 function beatFor(
   update: (patch: Partial<UploadFile>) => void,
 ): () => void {
@@ -662,7 +674,13 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
     .map((a) => {
       const v = a.latest_version!
       const file = v.files?.[0]
-      const status = mapProcessingStatus(v.processing_status)
+      // History is all a browser has for an upload started somewhere else, and
+      // an `uploading` version there used to come back as Interrupted even
+      // while the other device was still sending it.
+      const until = v.processing_status === 'uploading' ? liveUntil(v.last_activity_at) : undefined
+      const status = until !== undefined && Date.now() < until
+        ? 'elsewhere' as const
+        : mapProcessingStatus(v.processing_status)
       return {
         id: `history-${a.id}`,
         fileName: file?.original_filename ?? a.name,
@@ -675,12 +693,13 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
         // except the one that mattered: an interrupted upload rendered as
         // "Uploading 100%" forever. Resuming replaces this with the real figure
         // as soon as the parts already held come back from the server.
-        progress: status === 'interrupted' ? 0 : 100,
+        progress: status === 'interrupted' || status === 'elsewhere' ? 0 : 100,
         processingProgress: v.processing_status === 'ready' ? 100 : 0,
         status,
         assetId: a.id,
         versionId: v.id,
         createdAt: new Date(v.created_at).getTime(),
+        elsewhereUntil: status === 'elsewhere' ? until : undefined,
       }
     })
   return [...existing, ...newFiles]
@@ -794,7 +813,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 
         const parts = await uploadAllParts(
           file, s3_key, upload_id, controller,
-          (percent) => updateFile(id, { progress: percent }),
+          (percent) => updateFile(id, { progress: percent, heartbeatAt: Date.now() }),
           UPLOAD_CONCURRENCY,
           { chunkSize: initRes.chunk_size_bytes },
         )
@@ -932,7 +951,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 
         const parts = await uploadAllParts(
           file, s3_key, upload_id, controller,
-          (percent) => updateFile(id, { progress: percent }),
+          (percent) => updateFile(id, { progress: percent, heartbeatAt: Date.now() }),
           UPLOAD_CONCURRENCY,
           { chunkSize: initRes.chunk_size_bytes },
         )
@@ -1014,12 +1033,13 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         // Two tabs sending the same part numbers into one multipart upload leave
         // the completing tab with ETags that no longer match what is stored.
         if (activeElsewhere(row, info, Date.now())) {
+          const refusedAt = info.last_activity_at
           info = undefined
           if (get().files.find((f) => f.id === fileId)?.status !== 'cancelled') {
             updateFile({
               status: 'elsewhere',
               progress: row.progress,
-              elsewhereUntil: Date.now() + LIVE_WINDOW_MS,
+              elsewhereUntil: liveUntil(refusedAt),
             })
           }
           return
@@ -1054,7 +1074,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           }
           parts = await uploadAllParts(
             file, info.s3_key, info.upload_id, controller,
-            (percent) => updateFile({ progress: percent }),
+            (percent) => updateFile({ progress: percent, heartbeatAt: Date.now() }),
             UPLOAD_CONCURRENCY,
             { chunkSize: info.chunk_size_bytes, alreadyHeld: held },
           )
@@ -1170,7 +1190,10 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     if (activeElsewhere(row, info, Date.now())) {
       set((s) => ({
         files: s.files.map((f) => (f.id === fileId
-          ? { ...f, status: 'elsewhere' as const, elsewhereUntil: Date.now() + LIVE_WINDOW_MS }
+          // Held until the server's window runs out rather than for a fresh
+          // one from now: the poll then offers the row again the moment a
+          // second attempt can succeed.
+          ? { ...f, status: 'elsewhere' as const, elsewhereUntil: liveUntil(info.last_activity_at) }
           : f)),
       }))
       return ELSEWHERE_MESSAGE

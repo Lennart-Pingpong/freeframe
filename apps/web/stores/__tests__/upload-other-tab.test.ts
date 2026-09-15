@@ -215,12 +215,105 @@ describe('discarding or resuming an upload that is still moving somewhere else',
   })
 })
 
+// ---------------------------------------------------------- the second attempt
+
+describe('after a refusal', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.post).mockResolvedValue({} as never)
+  })
+
+  it('holds the row only until the server stops counting the upload as live', async () => {
+    // Held for a fresh window from the refusal, the row kept saying Elsewhere
+    // for up to two and a half minutes after a second attempt could already
+    // have worked -- which, with a refusal that also renewed the activity it
+    // refused on, read as a resume that never became possible.
+    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined })] })
+    const lastMoved = secondsAgo(100)
+    vi.mocked(api.get).mockResolvedValue(resumeInfo(lastMoved) as never)
+
+    await useUploadStore.getState().discardUpload('row-1')
+
+    expect(rowOf('row-1').elsewhereUntil).toBe(lastMoved.getTime() + LIVE_WINDOW_MS)
+  })
+})
+
+// ---------------------------------------------------------- history from another device
+
+describe('an upload that only history knows about', () => {
+  function assetUploading(lastActivity: Date) {
+    return {
+      id: 'asset-9', project_id: 'project-1', name: 'clip', asset_type: 'video',
+      latest_version: {
+        id: 'version-9', asset_id: 'asset-9', version_number: 1,
+        processing_status: 'uploading', created_by: 'u', created_at: new Date().toISOString(),
+        deleted_at: null, last_activity_at: lastActivity.toISOString(), files: [],
+      },
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useUploadStore.setState({ files: [], historyLoaded: false })
+  })
+
+  it('is shown as running elsewhere while the other device is still sending it', async () => {
+    // It came back as Interrupted, with Resume and Discard, while another
+    // browser was still uploading it.
+    vi.mocked(api.get).mockResolvedValue([assetUploading(secondsAgo(20))] as never)
+
+    await useUploadStore.getState().fetchHistory()
+
+    expect(useUploadStore.getState().files[0].status).toBe('elsewhere')
+  })
+
+  it('is interrupted once it has not moved for the whole window', async () => {
+    vi.mocked(api.get).mockResolvedValue([assetUploading(secondsAgo(600))] as never)
+
+    await useUploadStore.getState().fetchHistory()
+
+    expect(useUploadStore.getState().files[0].status).toBe('interrupted')
+  })
+})
+
 // ---------------------------------------------------------- stamping its own
 
 describe('a tab that is sending', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useUploadStore.setState({ files: [] })
+  })
+
+  it('stamps the row with every finished part, not only on its timer', async () => {
+    // A hidden tab's timers run about once a minute and its requests do not,
+    // so on the timer alone the stamp fell behind the transfer.
+    let clock = 1_000_000
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000))
+    vi.mocked(api.post).mockImplementation((path: string) => {
+      if (path === '/upload/initiate') {
+        return Promise.resolve({
+          upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
+          version_id: VERSION_ID, chunk_size_bytes: 10 * MB,
+        }) as never
+      }
+      if (path === '/upload/presign-part') {
+        return Promise.resolve({ presigned_url: 'https://s3.example/p' }) as never
+      }
+      return new Promise(() => {}) as never // completion never answers
+    })
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, headers: { get: () => '"e"' } }) as never
+
+    const id = useUploadStore.getState().startUpload(
+      new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
+    )
+    try {
+      const claimed = rowOf(id).heartbeatAt!
+      await vi.waitFor(() => expect(rowOf(id).progress).toBeGreaterThan(0))
+
+      expect(rowOf(id).heartbeatAt!).toBeGreaterThan(claimed)
+    } finally {
+      now.mockRestore()
+    }
   })
 
   it('claims the row and stamps it', async () => {
