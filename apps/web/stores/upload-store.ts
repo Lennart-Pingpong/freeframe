@@ -426,7 +426,7 @@ interface UploadStore {
   setPanelOpen: (open: boolean) => void
   togglePanel: () => void
   startUpload: (file: File, projectId: string, assetName: string, projectName?: string, folderId?: string | null) => string
-  startVersionUpload: (file: File, assetId: string, assetName: string, projectId: string) => string
+  startVersionUpload: (file: File, assetId: string, assetName: string, projectId: string, projectName?: string) => string
   resumeUpload: (fileId: string, file: File) => void
   discardUpload: (fileId: string) => Promise<void>
   cancelUpload: (fileId: string) => void
@@ -721,7 +721,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     return id
   },
 
-  startVersionUpload: (file, assetId, assetName, projectId) => {
+  startVersionUpload: (file, assetId, assetName, projectId, projectName) => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const entry: UploadFile = {
       id,
@@ -729,6 +729,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       fileSize: file.size,
       fileType: file.type,
       projectId,
+      projectName,
       assetName,
       progress: 0,
       processingProgress: 0,
