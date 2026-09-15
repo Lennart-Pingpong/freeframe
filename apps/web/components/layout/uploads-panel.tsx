@@ -15,10 +15,12 @@ import {
   Cog,
   PauseCircle,
   Trash2,
+  MonitorUp,
 } from 'lucide-react'
 import { cn, formatBytes, formatRelativeTime } from '@/lib/utils'
 import { useUploadStore, type UploadFile, type UploadStatus } from '@/stores/upload-store'
 import { carriesFiles } from '@/lib/drag'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -36,7 +38,8 @@ function matchesFilter(status: UploadStatus, filter: FilterTab): boolean {
     case 'all': return true
     // `interrupted` is deliberately not active: nothing is being transferred, so
     // listing it here would put a row that cannot move next to ones that are.
-    case 'active': return status === 'pending' || status === 'uploading' || status === 'processing'
+    // `elsewhere` is: bytes are moving, just not from this tab.
+    case 'active': return status === 'pending' || status === 'uploading' || status === 'processing' || status === 'elsewhere'
     case 'complete': return status === 'complete'
     case 'failed': return status === 'failed' || status === 'cancelled' || status === 'interrupted'
   }
@@ -86,6 +89,8 @@ function StatusBadge({ status }: { status: UploadStatus }) {
       return <span className="inline-flex items-center gap-1 rounded-full bg-white/5 px-2 py-0.5 text-[10px] font-medium text-text-tertiary"><Ban className="h-2.5 w-2.5" />Cancelled</span>
     case 'interrupted':
       return <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400"><PauseCircle className="h-2.5 w-2.5" />Interrupted</span>
+    case 'elsewhere':
+      return <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent"><MonitorUp className="h-2.5 w-2.5" />Elsewhere</span>
   }
 }
 
@@ -97,6 +102,11 @@ function UploadItem({ upload }: { upload: UploadFile }) {
   const isProcessing = upload.status === 'processing'
   const isInterrupted = upload.status === 'interrupted'
   const showProgress = isUploading || isProcessing
+
+  // Discard is the one control here whose effect cannot be taken back: the
+  // parts are deleted the moment it returns, and there is no version restore.
+  const [confirmingDiscard, setConfirmingDiscard] = React.useState(false)
+  const [discardError, setDiscardError] = React.useState<string | null>(null)
 
   const progressValue = isProcessing ? upload.processingProgress : upload.progress
 
@@ -168,6 +178,14 @@ function UploadItem({ upload }: { upload: UploadFile }) {
           {upload.status === 'failed' && upload.error && (
             <span className="text-[11px] text-status-error truncate">{upload.error}</span>
           )}
+          {upload.status === 'elsewhere' && (
+            // Offers nothing. Discard from here would delete the parts under a
+            // transfer that is still running, and a resume would send the same
+            // parts twice into one upload.
+            <span className="text-[11px] text-text-secondary truncate">
+              Still uploading in another tab or on another device
+            </span>
+          )}
           {upload.status === 'interrupted' && (
             // The reason gets the whole line, and red when there is one. A
             // rejected file is the case that matters: it is the only outcome the
@@ -205,7 +223,7 @@ function UploadItem({ upload }: { upload: UploadFile }) {
               <RotateCcw className="h-3.5 w-3.5" />
             </button>
             <button
-              onClick={() => { void discardUpload(upload.id) }}
+              onClick={() => { setDiscardError(null); setConfirmingDiscard(true) }}
               className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-status-error hover:bg-bg-hover transition-colors"
               title="Discard this upload and free the space it is holding"
             >
@@ -213,6 +231,23 @@ function UploadItem({ upload }: { upload: UploadFile }) {
             </button>
           </>
         )}
+        <ConfirmDialog
+          open={confirmingDiscard}
+          onOpenChange={setConfirmingDiscard}
+          title={`Discard ${upload.fileName}?`}
+          description="The parts already sent are deleted now and cannot be recovered. To finish this upload instead, resume it."
+          confirmLabel="Discard"
+          variant="danger"
+          error={discardError}
+          onConfirm={async () => {
+            const refused = await discardUpload(upload.id)
+            // The dialog stays open on a message, which is how it says why.
+            if (refused) {
+              setDiscardError(refused)
+              throw new Error(refused)
+            }
+          }}
+        />
         {isUploading && (
           <button
             onClick={() => cancelUpload(upload.id)}
@@ -288,7 +323,7 @@ export function UploadsPanel() {
 
   const counts = {
     all: files.length,
-    active: files.filter((f) => f.status === 'pending' || f.status === 'uploading' || f.status === 'processing').length,
+    active: files.filter((f) => matchesFilter(f.status, 'active')).length,
     complete: files.filter((f) => f.status === 'complete').length,
     failed: files.filter((f) => matchesFilter(f.status, 'failed')).length,
   }
