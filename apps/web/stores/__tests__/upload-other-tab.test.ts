@@ -234,3 +234,46 @@ describe('a tab that is sending', () => {
     expect(rowOf(id).heartbeatAt).toBeGreaterThan(Date.now() - 1000)
   })
 })
+
+// ---------------------------------------------------------- cancel
+
+describe('cancelling an upload', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useUploadStore.setState({ files: [], versionsRevision: 0 })
+    vi.mocked(api.post).mockImplementation((path: string) => {
+      if (path === '/upload/initiate') {
+        return Promise.resolve({
+          upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
+          version_id: VERSION_ID, chunk_size_bytes: 10 * MB,
+        }) as never
+      }
+      if (path === '/upload/presign-part') {
+        return Promise.resolve({ presigned_url: 'https://s3.example/p' }) as never
+      }
+      return Promise.resolve({}) as never
+    })
+    // A part that only ends when it is aborted.
+    global.fetch = vi.fn((_: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () =>
+        reject(new DOMException('Aborted', 'AbortError')))
+    })) as never
+  })
+
+  it('throws the upload away rather than recording a failure, and tells the version list', async () => {
+    // A plain abort left the version `failed`: a red badge in the switcher for
+    // an upload somebody stopped on purpose. And nothing told the switcher,
+    // which went on saying "Uploading" until a reload.
+    const id = useUploadStore.getState().startUpload(
+      new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
+    )
+    await vi.waitFor(() => expect(global.fetch).toHaveBeenCalled())
+
+    useUploadStore.getState().cancelUpload(id)
+
+    await vi.waitFor(() => expect(useUploadStore.getState().versionsRevision).toBe(1))
+    expect(api.post).toHaveBeenCalledWith('/upload/abort', {
+      s3_key: 'raw/k', upload_id: 'u1', version_id: VERSION_ID, discard: true,
+    })
+  })
+})
