@@ -530,30 +530,40 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
           </span>
         </div>
 
-        {/* Center: asset navigation */}
-        {totalAssets > 1 && (
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              onClick={() => prevAsset && navigateAsset(prevAsset.id)}
-              disabled={!prevAsset}
-              className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-              title="Previous asset (←)"
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </button>
-            <span className="text-xs text-text-secondary tabular-nums px-1">
-              {currentIndex + 1} of {totalAssets}
-            </span>
-            <button
-              onClick={() => nextAsset && navigateAsset(nextAsset.id)}
-              disabled={!nextAsset}
-              className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-              title="Next asset (→)"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </button>
-          </div>
-        )}
+        {/* Center: asset navigation, then the credit.
+
+            One group, not two things each centred on its own. The credit used
+            to be absolutely positioned at the middle of the bar, and the
+            navigator lands there too -- the blocks either side of it are both
+            flex-1 -- so on any asset with a neighbour "Powered by FreeFrame"
+            was drawn straight across "5 of 7". With no neighbour the navigator
+            is not rendered and the credit is centred alone, as before. */}
+        <div className="flex items-center gap-3 shrink-0">
+          {totalAssets > 1 && (
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                onClick={() => prevAsset && navigateAsset(prevAsset.id)}
+                disabled={!prevAsset}
+                className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Previous asset (←)"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <span className="text-xs text-text-secondary tabular-nums px-1">
+                {currentIndex + 1} of {totalAssets}
+              </span>
+              <button
+                onClick={() => nextAsset && navigateAsset(nextAsset.id)}
+                disabled={!nextAsset}
+                className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Next asset (→)"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+          <PoweredByBadge showIcon />
+        </div>
 
         {/* Right: version, share, sidebar toggle */}
         <div className="flex items-center gap-2 shrink-0 flex-1 justify-end">
@@ -622,10 +632,6 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
           >
             <Columns2 className="h-4 w-4" />
           </button>
-        </div>
-        {/* Center: Powered by FreeFrame */}
-        <div className="absolute left-1/2 -translate-x-1/2">
-          <PoweredByBadge showIcon />
         </div>
       </div>
 
