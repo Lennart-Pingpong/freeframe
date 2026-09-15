@@ -189,6 +189,32 @@ def test_it_reports_the_activity_from_before_it_asked(
     assert version.last_activity_at > earlier
 
 
+def test_asking_about_an_upload_that_just_moved_does_not_count_as_moving_it(
+    client, auth_headers, mock_db, resumable, monkeypatch
+):
+    """Otherwise a refusal renews itself.
+
+    The client refuses to discard or resume an upload that moved within the last
+    few minutes. If the request it made to find that out were recorded as
+    activity, the next attempt would find it "just moved" again -- and so would
+    every attempt after it, for as long as someone kept pressing Resume.
+    """
+    from datetime import datetime, timedelta, timezone
+    version, _ = resumable
+    recently = datetime.now(timezone.utc) - timedelta(seconds=40)
+    version.last_activity_at = recently
+    monkeypatch.setattr(upload_module, "list_upload_parts", lambda k, u: [])
+
+    first = client.get(_url(version), headers=auth_headers)
+    assert version.last_activity_at == recently
+
+    # And a second look reports the same moment, not the first look.
+    mock_db.first.side_effect = [version, _]
+    second = client.get(_url(version), headers=auth_headers)
+    assert first.json()["last_activity_at"] == second.json()["last_activity_at"]
+    mock_db.commit.assert_not_called()
+
+
 def test_the_recorded_chunk_size_decides_which_parts_are_held(
     client, auth_headers, mock_db, test_user, monkeypatch
 ):
