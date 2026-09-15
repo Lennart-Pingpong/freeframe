@@ -21,6 +21,7 @@ from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+import apps.api.routers.folders as folders_module
 import apps.api.routers.upload as upload_module
 import apps.api.tasks.cleanup_tasks as cleanup
 from apps.api.models.asset import (
@@ -254,3 +255,35 @@ def test_without_a_role_on_the_project_the_version_goes_but_the_asset_stays(db, 
 
     assert _committed(db, AssetVersion, version.id).deleted_at is not None
     assert _committed(db, Asset, asset.id).deleted_at is None
+
+
+# ─── The trash ───────────────────────────────────────────────────────────────
+
+def test_a_discarded_first_upload_is_not_offered_in_the_trash(db, storage):
+    """It was never an asset anyone could open, so it is not deleted work.
+
+    Listed, it would pile up beside the things people actually deleted, and
+    restoring it would bring back the unopenable card the strip exists to remove.
+    """
+    owner, project, discarded, (version,) = _seed(db)
+    _abort(db, owner, version)
+
+    deleted = Asset(project_id=project.id, name="real", asset_type=AssetType.video,
+                    created_by=owner.id)
+    db.add(deleted)
+    db.flush()
+    db.add(AssetVersion(asset_id=deleted.id, version_number=1,
+                        processing_status=ProcessingStatus.ready, created_by=owner.id))
+    from datetime import datetime, timezone
+    deleted.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+
+    listed = folders_module.list_trash(project.id, skip=0, limit=50, db=db, current_user=owner)
+
+    ids = {a["id"] for a in listed["assets"]}
+    assert str(deleted.id) in ids
+    assert str(discarded.id) not in ids
+
+    with pytest.raises(HTTPException) as refused:
+        folders_module.restore_asset(discarded.id, db=db, current_user=owner)
+    assert refused.value.status_code == 404
