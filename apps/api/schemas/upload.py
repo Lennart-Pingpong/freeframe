@@ -1,4 +1,5 @@
-from typing import Literal
+from datetime import datetime
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 import uuid
 from ..models.asset import AssetType
@@ -141,3 +142,9 @@ class ResumeUploadResponse(BaseModel):
     original_filename: str
     mime_type: str
     held_part_numbers: list[int]
+    # When something last happened on this upload *before* this request, which
+    # itself counts as activity and moves the stored value. The client reads it
+    # before doing anything irreversible: a recent value means the transfer may
+    # still be running somewhere else -- another tab, another device -- and a
+    # discard or a second resume there would destroy it.
+    last_activity_at: Optional[datetime] = None

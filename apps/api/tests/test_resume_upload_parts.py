@@ -167,6 +167,28 @@ def test_asking_to_resume_counts_as_activity(
     mock_db.commit.assert_called_once()
 
 
+def test_it_reports_the_activity_from_before_it_asked(
+    client, auth_headers, resumable, monkeypatch
+):
+    """The client asks before a discard whether the upload is still running.
+
+    This request is itself recorded as activity, so reporting the stored value
+    after that would always say "just now", and every discard would look like it
+    was aimed at a live transfer.
+    """
+    from datetime import datetime, timedelta, timezone
+    version, _ = resumable
+    earlier = datetime.now(timezone.utc) - timedelta(minutes=10)
+    version.last_activity_at = earlier
+    monkeypatch.setattr(upload_module, "list_upload_parts", lambda k, u: [])
+
+    resp = client.get(_url(version), headers=auth_headers)
+
+    reported = datetime.fromisoformat(resp.json()["last_activity_at"])
+    assert reported == earlier
+    assert version.last_activity_at > earlier
+
+
 def test_the_recorded_chunk_size_decides_which_parts_are_held(
     client, auth_headers, mock_db, test_user, monkeypatch
 ):

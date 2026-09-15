@@ -329,6 +329,9 @@ def list_held_parts(
         )
 
     s3_key = media_file.s3_key_raw
+    # Captured before anything below records this request as activity. Both
+    # initiate paths set it, so it is only missing on a row older than the column.
+    previous_activity = version.last_activity_at
     try:
         stored = list_upload_parts(s3_key, version.upload_id)
     except MultipartUploadGone:
@@ -355,6 +358,7 @@ def list_held_parts(
             original_filename=media_file.original_filename,
             mime_type=media_file.mime_type,
             held_part_numbers=[],
+            last_activity_at=previous_activity,
         )
     except MultipartListingUnsupported:
         # No listing, so nothing is known to be held and every part is sent
@@ -388,6 +392,7 @@ def list_held_parts(
         original_filename=media_file.original_filename,
         mime_type=media_file.mime_type,
         held_part_numbers=held,
+        last_activity_at=previous_activity,
     )
 
 
