@@ -408,14 +408,28 @@ describe('discardUpload', () => {
     expect(useUploadStore.getState().files).toEqual([])
   })
 
-  it('removes the row even when the server cannot be told', async () => {
-    // What is left in the bucket is the reaper's job, and it has the activity
-    // timestamp it needs. Leaving the row would be a button that does nothing.
-    vi.mocked(api.get).mockRejectedValue(new ApiError(503, 'Could not reach storage.'))
+  it('keeps the row, and says why, when the server cannot be told', async () => {
+    // It used to leave the list before the request and swallow every failure,
+    // so a 503 from unreachable storage left no row, no error, and a version the
+    // reaper would not touch for a day.
+    vi.mocked(api.post).mockRejectedValue(new ApiError(503, 'Could not reach storage.'))
 
-    await useUploadStore.getState().discardUpload('row-1')
+    const refused = await useUploadStore.getState().discardUpload('row-1')
 
+    expect(refused).toBe('Could not reach storage.')
+    expect(rowOf('row-1').status).toBe('interrupted')
+    expect(rowOf('row-1').error).toBe('Could not reach storage.')
+  })
+
+  it('drops the row when there is no longer anything to discard', async () => {
+    // 404: the reaper or another tab got there first.
+    vi.mocked(api.get).mockRejectedValue(new ApiError(404, 'Version not found'))
+
+    const refused = await useUploadStore.getState().discardUpload('row-1')
+
+    expect(refused).toBeNull()
     expect(useUploadStore.getState().files).toEqual([])
+    expect(api.post).not.toHaveBeenCalled()
   })
 })
 

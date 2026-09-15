@@ -9,6 +9,100 @@ const PART_MAX_ATTEMPTS = 8 // per part, including the first try
 const PART_RETRY_BASE_MS = 2000 // 2s, 4s, 8s … ≈254s of total tolerance per part
 
 /**
+ * How often a tab that is transferring says so, and how long that is believed.
+ *
+ * Rows are persisted to `localStorage`, which every tab of the origin shares, so
+ * a second tab reads the first tab's in-flight rows. Whether one of them is
+ * still moving is not something the row itself can say -- it says `uploading`
+ * whether or not anything is behind it -- so the tab doing the work stamps it.
+ *
+ * The window is long against the beat on purpose. A hidden tab's timers are
+ * throttled to about once a minute, and a transfer in a background tab is the
+ * ordinary case rather than the odd one. The cost of the long window is only
+ * that a tab that has really gone takes this long to be believed gone.
+ */
+const HEARTBEAT_MS = 15_000
+export const LIVE_WINDOW_MS = 150_000
+
+const TAB_KEY = 'ff-upload-tab'
+const newTabId = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+/**
+ * Which tab this is, kept across a reload of the same tab.
+ *
+ * A reload is the case the persisted rows exist for: the transfer died with
+ * the page, and the row has to come back as `interrupted` straight away, not
+ * after a window of looking live. `sessionStorage` survives a reload and is not
+ * shared between tabs, which is exactly that distinction.
+ *
+ * Except that "Duplicate tab" copies `sessionStorage`, so the copy starts out
+ * with the original's id and would take its live rows for its own. The copy
+ * asks on a channel whether the id is taken; the original answers, and the
+ * copy picks a new one.
+ */
+let tabId: string = (() => {
+  if (typeof window === 'undefined') return newTabId()
+  try {
+    const kept = window.sessionStorage.getItem(TAB_KEY)
+    if (kept) return kept
+    const fresh = newTabId()
+    window.sessionStorage.setItem(TAB_KEY, fresh)
+    return fresh
+  } catch {
+    return newTabId()
+  }
+})()
+
+export function currentTabId(): string {
+  return tabId
+}
+
+/**
+ * Where a row read out of storage stands, judged from this tab.
+ *
+ * Nothing in this tab is pushing bytes for it, whatever it said when it was
+ * written. If this tab wrote it, the transfer died with the page and the row is
+ * `interrupted`. If another tab wrote it and stamped it recently, that tab is
+ * very likely still sending, and the row is `elsewhere`: shown, but offering
+ * nothing, because Discard would destroy the transfer and a second Resume would
+ * write the same part numbers into one multipart upload.
+ */
+function standingOfStoredRow(f: UploadFile, now: number): UploadFile {
+  if (f.status !== 'uploading' && f.status !== 'elsewhere') return f
+  if (!f.versionId || !f.uploadId) {
+    return { ...f, status: 'failed', error: 'Upload interrupted' }
+  }
+  const beating = f.heartbeatAt !== undefined && now - f.heartbeatAt < LIVE_WINDOW_MS
+  if (f.ownerTab !== currentTabId() && beating) {
+    return { ...f, status: 'elsewhere', error: undefined }
+  }
+  return { ...f, status: 'interrupted', error: undefined }
+}
+
+/** The heartbeat the row carries in shared storage right now, as the tab doing
+ *  the work last wrote it -- not the copy this tab read when it loaded. */
+function storedHeartbeat(fileId: string): number | undefined {
+  try {
+    const raw = window.localStorage.getItem('ff-uploads')
+    const files = (JSON.parse(raw ?? '{}') as { state?: { files?: UploadFile[] } }).state?.files
+    return files?.find((f) => f.id === fileId)?.heartbeatAt
+  } catch {
+    return undefined
+  }
+}
+
+/** Whether the server has seen this upload move too recently to be touched from
+ *  here. Only asked for a row this tab did not start: this tab knows whether it
+ *  is still sending its own. */
+function activeElsewhere(row: UploadFile, info: ResumeInfo, now: number): boolean {
+  if (row.ownerTab === currentTabId()) return false
+  if (!info.last_activity_at) return false
+  return now - Date.parse(info.last_activity_at) < LIVE_WINDOW_MS
+}
+
+const ELSEWHERE_MESSAGE = 'Still uploading in another tab or on another device'
+
+/**
  * Parts in flight per upload.
  *
  * Five hides the per-part presign round-trip without opening more sockets than
@@ -350,6 +444,7 @@ if (typeof document !== 'undefined') {
  */
 export type UploadStatus =
   | 'pending' | 'uploading' | 'processing' | 'complete' | 'failed' | 'cancelled' | 'interrupted'
+  | 'elsewhere'
 
 export interface UploadFile {
   id: string
@@ -367,6 +462,14 @@ export interface UploadFile {
   versionId?: string
   uploadId?: string
   createdAt: number // timestamp for grouping
+  /** The tab that is transferring this row, see `currentTabId`. */
+  ownerTab?: string
+  /** When that tab last said it still is, see `HEARTBEAT_MS`. */
+  heartbeatAt?: number
+  /** Set when the server refused to let this tab touch the upload because it
+   *  had just moved. Kept `elsewhere` at least until then, since a transfer on
+   *  another device leaves no heartbeat in this browser's storage. */
+  elsewhereUntil?: number
 }
 
 /** POST /upload/initiate and POST /assets/{id}/versions — both answer with this.
@@ -398,6 +501,8 @@ interface ResumeInfo {
   original_filename: string
   mime_type: string
   held_part_numbers: number[]
+  /** When the upload last moved before this request; see `activeElsewhere`. */
+  last_activity_at?: string | null
 }
 
 /**
@@ -415,6 +520,17 @@ function isFinalRefusal(err: unknown): boolean {
 
 // AbortControllers for cancellation
 const abortControllers: Record<string, AbortController> = {}
+
+/** Claims a row for this tab and keeps stamping it until the returned stop is
+ *  called. Written through the store, so it reaches shared storage the same way
+ *  progress does. */
+function beatFor(
+  update: (patch: Partial<UploadFile>) => void,
+): () => void {
+  update({ ownerTab: currentTabId(), heartbeatAt: Date.now() })
+  const timer = setInterval(() => update({ heartbeatAt: Date.now() }), HEARTBEAT_MS)
+  return () => clearInterval(timer)
+}
 
 interface UploadStore {
   files: UploadFile[]
@@ -436,7 +552,8 @@ interface UploadStore {
   startUpload: (file: File, projectId: string, assetName: string, projectName?: string, folderId?: string | null) => string
   startVersionUpload: (file: File, assetId: string, assetName: string, projectId: string, projectName?: string) => string
   resumeUpload: (fileId: string, file: File) => void
-  discardUpload: (fileId: string) => Promise<void>
+  /** Resolves to a message saying why nothing was discarded, or null. */
+  discardUpload: (fileId: string) => Promise<string | null>
   cancelUpload: (fileId: string) => void
   removeFile: (fileId: string) => void
   clearCompleted: () => void
@@ -569,6 +686,21 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
   return [...existing, ...newFiles]
 }
 
+/** The row stays, saying why. What the server managed before it stopped
+ *  answering is not knowable from here, so the version list is told to refetch. */
+function reportDiscardFailure(
+  set: (fn: (s: UploadStore) => Partial<UploadStore>) => void,
+  fileId: string,
+  err: unknown,
+): string {
+  const message = err instanceof Error ? err.message : 'Discard failed'
+  set((s) => ({
+    files: s.files.map((f) => (f.id === fileId ? { ...f, error: message } : f)),
+    versionsRevision: s.versionsRevision + 1,
+  }))
+  return message
+}
+
 const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = (set, get) => ({
   files: [],
   versionsRevision: 0,
@@ -620,6 +752,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       let completionAttempted = false
 
       retainWakeLock()
+      const stopBeat = beatFor((patch) => updateFile(id, patch))
       try {
         updateFile(id, { status: 'uploading' })
 
@@ -722,6 +855,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           await api.post('/upload/abort', { s3_key, upload_id, version_id }).catch(() => {})
         }
       } finally {
+        stopBeat()
         releaseWakeLock()
         delete abortControllers[id]
       }
@@ -760,6 +894,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       let version_id: string | undefined
       let completionAttempted = false
       retainWakeLock()
+      const stopBeat = beatFor((patch) => updateFile(id, patch))
       try {
         updateFile(id, { status: 'uploading' })
         const initRes = await api.post<VersionInitiateResponse>(
@@ -825,6 +960,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           await api.post('/upload/abort', { s3_key, upload_id, version_id }).catch(() => {})
         }
       } finally {
+        stopBeat()
         releaseWakeLock()
         delete abortControllers[id]
       }
@@ -847,6 +983,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       abortControllers[fileId] = controller
       let info: ResumeInfo | undefined
       let completionAttempted = false
+      let stopBeat = () => {}
       retainWakeLock()
       try {
         updateFile({ status: 'uploading', progress: 0, error: undefined })
@@ -855,6 +992,21 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         // and the upload id: this row may have been rehydrated from history in a
         // browser that never saw them.
         info = await api.get<ResumeInfo>(`/upload/${versionId}/parts`)
+
+        // Two tabs sending the same part numbers into one multipart upload leave
+        // the completing tab with ETags that no longer match what is stored.
+        if (activeElsewhere(row, info, Date.now())) {
+          info = undefined
+          if (get().files.find((f) => f.id === fileId)?.status !== 'cancelled') {
+            updateFile({
+              status: 'elsewhere',
+              progress: row.progress,
+              elsewhereUntil: Date.now() + LIVE_WINDOW_MS,
+            })
+          }
+          return
+        }
+        stopBeat = beatFor(updateFile)
 
         // `assembled` means the object is whole and only the completion is
         // outstanding, so the file is not needed and is not checked -- refusing
@@ -960,6 +1112,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           }).catch(() => {})
         }
       } finally {
+        stopBeat()
         releaseWakeLock()
         delete abortControllers[fileId]
       }
@@ -971,11 +1124,41 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     // to be rid of an upload the user does not want back is to wait for the
     // reaper, and the row would keep offering a resume in the meantime.
     const row = get().files.find((f) => f.id === fileId)
-    if (!row) return
-    set((s) => ({ files: s.files.filter((f) => f.id !== fileId) }))
-    if (!row.versionId) return
+    if (!row) return null
+    const drop = () => set((s) => ({ files: s.files.filter((f) => f.id !== fileId) }))
+    if (!row.versionId) {
+      drop()
+      return null
+    }
+
+    let info: ResumeInfo
     try {
-      const info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`)
+      info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`)
+    } catch (err) {
+      // 404 or 409: the version is gone or no longer uploading, so there is
+      // nothing left to discard and the row has nothing to offer.
+      if (isFinalRefusal(err)) {
+        drop()
+        set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+        return null
+      }
+      return reportDiscardFailure(set, fileId, err)
+    }
+
+    // The server has seen this upload move within the window, and this tab is
+    // not the one moving it. Discard succeeds on every check the server can
+    // make -- the version really is still uploading -- and the tab doing the
+    // transfer gets NoSuchUpload on its next part.
+    if (activeElsewhere(row, info, Date.now())) {
+      set((s) => ({
+        files: s.files.map((f) => (f.id === fileId
+          ? { ...f, status: 'elsewhere' as const, elsewhereUntil: Date.now() + LIVE_WINDOW_MS }
+          : f)),
+      }))
+      return ELSEWHERE_MESSAGE
+    }
+
+    try {
       // `discard` and not a plain abort. A plain abort marks the version
       // `failed`, which leaves a red badge in the version switcher for an
       // upload somebody deliberately threw away -- and it takes its own branch
@@ -991,19 +1174,18 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         version_id: info.version_id,
         discard: true,
       })
-    } catch {
-      // The row is gone from the panel either way. What is left in the bucket is
-      // the reaper's job, and it has the activity timestamp it needs to do it.
-    } finally {
-      // Said after the server has answered, not when the row left the list: a
-      // screen showing this asset's versions has to refetch, and refetching
-      // while the request that deletes the version is still in flight would
-      // fetch the version back. Bumped on the failure path too -- what the
-      // server managed before it stopped answering is not knowable from here,
-      // and a refetch is cheap next to a switcher offering a version that is
-      // gone.
-      set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+    } catch (err) {
+      return reportDiscardFailure(set, fileId, err)
     }
+    // Only now. The row used to leave the list before the request and every
+    // failure was swallowed, so a 503 from unreachable storage left no row, no
+    // error, and a version the reaper would not touch for a day.
+    drop()
+    // Said after the server has answered: a screen showing this asset's
+    // versions has to refetch, and refetching while the delete is in flight
+    // would fetch the version back.
+    set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+    return null
   },
 
   cancelUpload: (fileId) => {
@@ -1090,6 +1272,23 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
   },
 
   refreshProcessingItems: async () => {
+    // A row another tab is sending stays that way while the other tab keeps
+    // stamping it in shared storage. Once it stops -- the transfer ended, or the
+    // tab went -- the row is judged like any interrupted one below, which is
+    // how a finished upload over there turns into processing here.
+    const now = Date.now()
+    if (get().files.some((f) => f.status === 'elsewhere')) {
+      set((s) => ({
+        files: s.files.map((f) => {
+          if (f.status !== 'elsewhere') return f
+          const beat = storedHeartbeat(f.id)
+          const beating = beat !== undefined && now - beat < LIVE_WINDOW_MS
+          const held = f.elsewhereUntil !== undefined && now < f.elsewhereUntil
+          return beating || held ? f : { ...f, status: 'interrupted' as const }
+        }),
+      }))
+    }
+
     // Interrupted rows are polled alongside processing ones. The same upload can
     // be resumed from another tab or another machine, and without this the row
     // here keeps offering a resume for a version that is already transcoding.
@@ -1156,30 +1355,54 @@ export const useUploadStore = create<UploadStore>()(
       files: state.files.filter(
         (f: UploadFile) =>
           f.status === 'failed' || f.status === 'cancelled' ||
-          f.status === 'interrupted' || f.status === 'uploading',
+          f.status === 'interrupted' || f.status === 'uploading' ||
+          f.status === 'elsewhere',
       ),
     }),
-    // Nothing is pushing bytes for a row that came out of storage, whatever it
-    // said when it was written, so an in-flight row is rewritten on the way in.
-    // A row that never reached an upload id has nothing to come back to and is
-    // failed -- the same rule the upload loop applies when a transfer breaks.
-    // Done in `merge` rather than after rehydration so the panel never renders
-    // a row claiming to be uploading.
+    // Nothing in this tab is pushing bytes for a row that came out of storage,
+    // whatever it said when it was written; `standingOfStoredRow` decides what it
+    // is instead. Done in `merge` rather than after rehydration so the panel
+    // never renders a row claiming to be uploading, or one offering Discard on a
+    // transfer another tab is still running.
     merge: (persisted, current) => {
       const stored = (persisted as { files?: UploadFile[] } | undefined)?.files ?? []
+      const now = Date.now()
       return {
         ...current,
         ...(persisted as object),
-        files: stored.map((f) =>
-          f.status === 'uploading'
-            ? {
-                ...f,
-                status: (f.versionId && f.uploadId ? 'interrupted' : 'failed') as UploadStatus,
-                error: f.versionId && f.uploadId ? undefined : 'Upload interrupted',
-              }
-            : f,
-        ),
+        files: stored.map((f) => standingOfStoredRow(f, now)),
       }
     },
   }),
 )
+
+// "Duplicate tab" copies sessionStorage, and with it this tab's id. Announce the
+// id; a live tab already holding it answers, and the copy takes a new one and
+// looks again at the rows it hydrated as its own.
+if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
+  try {
+    const channel = new BroadcastChannel('ff-upload-tabs')
+    const nonce = newTabId()
+    channel.onmessage = (e: MessageEvent) => {
+      const msg = e.data as { type?: string; tab?: string; nonce?: string }
+      if (msg.type === 'claim' && msg.tab === tabId && msg.nonce !== nonce) {
+        channel.postMessage({ type: 'taken', tab: tabId, nonce: msg.nonce })
+      } else if (msg.type === 'taken' && msg.nonce === nonce) {
+        const inherited = tabId
+        tabId = newTabId()
+        try { window.sessionStorage.setItem(TAB_KEY, tabId) } catch { /* private mode */ }
+        const now = Date.now()
+        useUploadStore.setState((s) => ({
+          files: s.files.map((f) =>
+            f.status === 'interrupted' && f.ownerTab === inherited
+              ? standingOfStoredRow({ ...f, status: 'uploading' }, now)
+              : f,
+          ),
+        }))
+      }
+    }
+    channel.postMessage({ type: 'claim', tab: tabId, nonce })
+  } catch {
+    // No channel, no duplicate detection: the reload case still works.
+  }
+}
