@@ -205,17 +205,20 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   // went on offering a version that was gone -- still labelled "Uploading",
   // which was the one thing it certainly was not.
   //
-  // The store says when it has changed versions behind the panel, and says it
-  // after the server has answered rather than when the row leaves the list:
-  // discard removes the row first so the button never looks inert, and
-  // refetching then would race the request that does the deleting.
+  // The store says when it has changed versions behind the panel -- a discard,
+  // or a cancel, which is sent as one -- and says it after the server has
+  // answered, since refetching earlier would race the request that does the
+  // deleting and fetch the version back.
   const versionsRevision = useUploadStore((s) => s.versionsRevision)
   const lastVersionsRevision = useRef(versionsRevision)
+  // Not gated on `asset` having loaded. The ref moves either way, so a bump
+  // arriving while `GET /assets/{id}` was in flight used to be dropped for good,
+  // and `refetchVersions` needs only the route's `assetId`.
   useEffect(() => {
     if (lastVersionsRevision.current === versionsRevision) return
     lastVersionsRevision.current = versionsRevision
-    if (asset?.id) refetchVersions()
-  }, [versionsRevision, asset?.id, refetchVersions])
+    refetchVersions()
+  }, [versionsRevision, refetchVersions])
 
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation

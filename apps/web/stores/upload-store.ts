@@ -701,6 +701,24 @@ function reportDiscardFailure(
   return message
 }
 
+/**
+ * Throw away an upload the user cancelled, and tell the version list.
+ *
+ * Sent as a discard. A plain abort records the version as `failed`, which left
+ * a red badge in the version switcher for an upload somebody deliberately
+ * stopped -- the same thing Discard was fixed for, and cancel is the far more
+ * common of the two. The server takes the flag only for a version still
+ * `uploading`, so a cancel that lost a race with its own completion is left
+ * alone. The switcher refetches on the revision, after the server answers.
+ */
+async function abortCancelled(
+  set: (fn: (s: UploadStore) => Partial<UploadStore>) => void,
+  ids: { s3_key: string; upload_id: string; version_id: string },
+): Promise<void> {
+  await api.post('/upload/abort', { ...ids, discard: true }).catch(() => {})
+  set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+}
+
 const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = (set, get) => ({
   files: [],
   versionsRevision: 0,
@@ -852,7 +870,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         // exactly the moment they became worth keeping. Everything else is left
         // for the user to resume or for the reaper to reclaim.
         if (userCancelled() && upload_id && s3_key && version_id) {
-          await api.post('/upload/abort', { s3_key, upload_id, version_id }).catch(() => {})
+          await abortCancelled(set, { s3_key, upload_id, version_id })
         }
       } finally {
         stopBeat()
@@ -957,7 +975,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         }
 
         if (userCancelled() && upload_id && s3_key && version_id) {
-          await api.post('/upload/abort', { s3_key, upload_id, version_id }).catch(() => {})
+          await abortCancelled(set, { s3_key, upload_id, version_id })
         }
       } finally {
         stopBeat()
@@ -1105,11 +1123,11 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         }
 
         if (userCancelled() && info) {
-          await api.post('/upload/abort', {
+          await abortCancelled(set, {
             s3_key: info.s3_key,
             upload_id: info.upload_id,
             version_id: info.version_id,
-          }).catch(() => {})
+          })
         }
       } finally {
         stopBeat()
@@ -1318,7 +1336,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           // told the upload landed, and the parts sit in the bucket until the
           // reaper. This is the guard `completedVersionStatus` carries for the
           // same reason -- the second half of #273.
-          if (f.versionId && asset.latest_version.id !== f.versionId) return f
+          if (!f.versionId || asset.latest_version.id !== f.versionId) return f
           const status = mapProcessingStatus(asset.latest_version.processing_status)
           if (status === f.status) return f
           return {
