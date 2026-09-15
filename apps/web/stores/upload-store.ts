@@ -69,11 +69,17 @@ export function currentTabId(): string {
  */
 function standingOfStoredRow(f: UploadFile, now: number): UploadFile {
   if (f.status !== 'uploading' && f.status !== 'elsewhere') return f
-  if (!f.versionId || !f.uploadId) {
+  // No version to come back to: the transfer broke before initiate answered.
+  // Only a row this browser was sending can be in that state. An `elsewhere`
+  // row may have come from history, which never carries an upload id -- the
+  // resume asks the server for it -- and failing that row turned an upload
+  // still running on another device into a dead "Failed" on the next load.
+  if (!f.versionId || (f.status === 'uploading' && !f.uploadId)) {
     return { ...f, status: 'failed', error: 'Upload interrupted' }
   }
   const beating = f.heartbeatAt !== undefined && now - f.heartbeatAt < LIVE_WINDOW_MS
-  if (f.ownerTab !== currentTabId() && beating) {
+  const held = f.elsewhereUntil !== undefined && now < f.elsewhereUntil
+  if ((f.ownerTab !== currentTabId() && beating) || held) {
     return { ...f, status: 'elsewhere', error: undefined }
   }
   return { ...f, status: 'interrupted', error: undefined }
