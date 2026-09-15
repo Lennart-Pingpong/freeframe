@@ -376,9 +376,9 @@ export default function ProjectDetailPage() {
           // Straight to startUpload rather than through the dialog. Dragging a
           // file onto the project has already said everything the dialog asks:
           // which file, which folder, and the name comes from the file. The
-          // single-file rename field is skipped, and renaming afterwards from
-          // the grid covers that.
-          file.name.replace(/\.[^/.]+$/, ""),
+          // single-file rename field is skipped; the row in the uploads panel
+          // takes the rename while the file is still going up.
+          assetNameFromFile(file.name),
           project?.name,
           folderId,
         ),

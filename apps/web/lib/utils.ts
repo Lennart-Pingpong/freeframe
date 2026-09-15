@@ -178,10 +178,11 @@ export async function copyToClipboard(text: string): Promise<boolean> {
  * The name to offer for a file being uploaded: the filename without its
  * extension.
  *
- * One home for it because the two upload paths disagreed. Picking a single
- * file put `cut-v3` in the name field; picking several uploaded them as
+ * One home for it because the upload paths disagreed. Picking a single file
+ * put `cut-v3` in the name field; picking several uploaded them as
  * `cut-v3.mov`, so the same drop produced differently named assets depending
- * on how many files were in it.
+ * on how many files were in it. Dropping onto the asset area had a third copy
+ * of the regex, and uses this too.
  *
  * A name that is nothing but an extension keeps it: `.gitignore` is the whole
  * name, and stripping it would leave an asset called "".
