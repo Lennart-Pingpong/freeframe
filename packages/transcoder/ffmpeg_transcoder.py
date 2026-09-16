@@ -311,6 +311,33 @@ def get_hdr_mode() -> str:
     return os.environ.get("TRANSCODER_HDR", "convert").lower()
 
 
+# Stream copy (TRANSCODER_SOURCE_COPY), off unless a deployment asks for it.
+# It only ever applies where the ladder has already resolved to a single
+# rendition at the source's own size, so it changes what a transcode costs,
+# never what it produces a rendition of. See the check in transcode().
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def source_copy_enabled() -> bool:
+    return os.environ.get("TRANSCODER_SOURCE_COPY", "").strip().lower() in _TRUTHY
+
+
+# What may be remuxed rather than encoded, kept deliberately narrow.
+# `codec_name == "h264"` on its own is not enough: High 10 and High 4:2:2 carry
+# the same codec name and play in no browser, and an NLE exports High 10 without
+# being asked. The pixel format is what tells them apart, so both are checked.
+_BROWSER_SAFE_CODECS = {"h264"}
+_BROWSER_SAFE_PIX_FMTS = {"yuv420p", "yuvj420p"}
+
+
+def is_browser_safe(stream: dict) -> bool:
+    """Whether this video stream is already what every browser can play."""
+    return (
+        stream.get("codec_name") in _BROWSER_SAFE_CODECS
+        and stream.get("pix_fmt") in _BROWSER_SAFE_PIX_FMTS
+    )
+
+
 # Runtime hardware failures that should transparently fall back to software.
 # These are environmental (no/!busy device, exhausted VRAM, missing driver
 # library), not input-specific, so re-running the same job on the CPU pipeline
@@ -709,7 +736,13 @@ class FFmpegTranscoder(BaseTranscoder):
                 "-show_streams", "-select_streams", "a", input_url,
             ]
             audio_result = self._run(audio_cmd, timeout=120, label="ffprobe")
-            has_audio = bool(json.loads(audio_result).get("streams"))
+            audio_streams = json.loads(audio_result).get("streams") or []
+            has_audio = bool(audio_streams)
+            # Only the copy path below reads this: AAC is what HLS carries, so
+            # it rides along untouched, and anything else (PCM is common out of
+            # an NLE) is encoded to AAC, which costs seconds and leaves the
+            # picture alone. The encoding path re-encodes audio regardless.
+            audio_codec = (audio_streams[0].get("codec_name") or "") if has_audio else ""
 
             # 3. Build quality ladder based on available qualities
             # Filter the ladder against the source resolution so a small
@@ -743,10 +776,88 @@ class FFmpegTranscoder(BaseTranscoder):
                 if source_width and source_height:
                     scale_targets[smallest] = f"{source_width}:{source_height}"
 
-            primary_backend = get_backend()
+            # 3b. Can this source be shipped as it is, rather than encoded?
+            #
+            # The ladder above has sometimes resolved to exactly one rendition
+            # at the source's own dimensions -- either a rung that matches the
+            # source, or the clamp doing it. When that is what is being built
+            # and the source is already the format browsers play, the encoder is
+            # being asked for a slightly worse copy of what it was handed.
+            # Remuxing produces the same picture in minutes instead of hours:
+            # measured on a 36 min 1080p H.264 master, 355s against ~55min on
+            # six CPU cores.
+            #
+            # Every condition is required, and together they are what keeps this
+            # from being a policy change:
+            #   * the deployment asked for it,
+            #   * one rendition, at exactly the source's size -- anyone who
+            #     configured a real ladder, or a rung below the source, still
+            #     gets every rendition they asked for,
+            #   * H.264 8-bit 4:2:0, checked on the pixel format and not on the
+            #     codec name alone, and
+            #   * SDR, since HDR and Dolby Vision are the cases the filter graph
+            #     exists for.
+            copy_source = (
+                source_copy_enabled()
+                and len(qualities) == 1
+                and scale_targets[qualities[0]] == f"{source_width}:{source_height}"
+                and is_browser_safe(_vid_stream)
+                and not is_hdr
+                and dovi_profile is None
+            )
+
+            if copy_source:
+                print(
+                    f"[transcoder] {job.input_s3_key} is already browser-safe "
+                    f"({_vid_stream.get('codec_name')}/{_vid_stream.get('pix_fmt')}) and the "
+                    f"ladder asks for {source_width}x{source_height}: remuxing, not re-encoding",
+                    flush=True,
+                )
+
+            primary_backend = "copy" if copy_source else get_backend()
 
             hls_dir = work_dir / "hls"
             hls_dir.mkdir()
+
+            def _build_copy_cmd() -> list[str]:
+                """Remux the source into HLS, leaving the video stream alone.
+
+                No filter graph and no encoder: the frames written out are the
+                ones that were uploaded, so there is no scale target, no CRF and
+                no colour handling to get right here, and no hardware to fall
+                back from.
+
+                Segments can only start on a keyframe, and a copy cannot make
+                new ones, so `-hls_time` is a floor rather than a target: a
+                master with a long GOP gets longer segments. Players handle
+                that, and the alternative would be re-encoding, which is the
+                thing being avoided.
+                """
+                cmd = ["ffmpeg", "-y", "-i", input_url, "-map", "0:v:0"]
+                if has_audio:
+                    cmd += ["-map", "0:a:0"]
+                cmd += ["-c:v", "copy"]
+                if has_audio:
+                    cmd += (
+                        ["-c:a", "copy"] if audio_codec == "aac"
+                        else ["-c:a", "aac", "-b:a", "192k"]
+                    )
+                cmd += [
+                    "-f", "hls",
+                    "-hls_time", "2",
+                    "-hls_playlist_type", "vod",
+                    "-hls_flags", "independent_segments",
+                    "-hls_segment_type", "mpegts",
+                    # ffmpeg writes the master playlist itself, with the CODECS
+                    # and RESOLUTION it reads off the stream. Hand-writing it
+                    # against a copied stream would be guessing, and hls.js
+                    # refuses a manifest whose codec string does not match.
+                    "-master_pl_name", "master.m3u8",
+                    "-var_stream_map", "v:0,a:0" if has_audio else "v:0",
+                    "-hls_segment_filename", str(hls_dir / "%v" / "seg_%03d.ts"),
+                    str(hls_dir / "%v" / "playlist.m3u8"),
+                ]
+                return cmd
 
             def _build_ffmpeg_cmd(backend: str) -> list[str]:
                 """Build the full ffmpeg command for a given backend.
@@ -755,6 +866,8 @@ class FFmpegTranscoder(BaseTranscoder):
                 HDR prefix, encoders, colour tags) is rebuilt consistently when
                 a hardware attempt has to fall back to software.
                 """
+                if backend == "copy":
+                    return _build_copy_cmd()
                 # DV is tone-mapped via libplacebo and encoded in software (see
                 # below), so force the CPU scale filter for it.
                 scale_filter = "scale" if dv_software else _BACKEND_SCALE.get(backend, "scale")
@@ -921,8 +1034,11 @@ class FFmpegTranscoder(BaseTranscoder):
             # device is unusable at runtime (most commonly another process on the
             # box has exhausted VRAM, so CUDA decode init fails with
             # CUDA_ERROR_OUT_OF_MEMORY). A slow transcode beats a failed asset.
+            # A copy runs no encoder and touches no device, so there is no
+            # hardware failure for it to degrade from; anything that stops it is
+            # about the input and would stop the second attempt too.
             attempts = [primary_backend]
-            if primary_backend != "cpu" and not dv_software:
+            if primary_backend not in ("cpu", "copy") and not dv_software:
                 attempts.append("cpu")
 
             backend = primary_backend
@@ -956,8 +1072,14 @@ class FFmpegTranscoder(BaseTranscoder):
                     hls_dir.mkdir(exist_ok=True)
 
             # 4. One downloadable file, remuxed from the rendition just encoded.
-            mp4_key = self._build_download_mp4(hls_dir, qualities, work_dir,
-                                               job.output_s3_prefix)
+            #    A copied source needs none: its rendition carries the uploaded
+            #    file's own stream, so the master the download falls back to is
+            #    the same picture at the same bitrate -- the size gap #350 exists
+            #    to close is not there. Writing a second copy of it would spend
+            #    exactly the storage this setting was turned on to save.
+            mp4_key = None if copy_source else self._build_download_mp4(
+                hls_dir, qualities, work_dir, job.output_s3_prefix
+            )
 
             # 5. Upload HLS files to S3
             uploaded_keys = self._upload_directory(hls_dir, job.output_s3_prefix)
