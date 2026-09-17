@@ -10,6 +10,7 @@ import {
   gbToBytes,
   bytesToGb,
   assetNameFromFile,
+  uploadNameForFile,
 } from '../utils'
 
 describe('formatTime', () => {
@@ -190,5 +191,27 @@ describe('assetNameFromFile', () => {
 
   it('keeps a dot that is part of the name', () => {
     expect(assetNameFromFile('Ep04 v2.1 final.mov')).toBe('Ep04 v2.1 final')
+  })
+})
+
+describe('uploadNameForFile', () => {
+  // The bug this pins: with several files selected, `:408` read the raw
+  // filename while the single-file path at `:354` had already prefilled the
+  // field with the stripped one. So three clips uploaded as "A047C012.mov" and
+  // one as "A047C012" -- the same file, named two different ways depending on
+  // what else was picked with it.
+  it('strips the extension for every file when several were picked', () => {
+    expect(uploadNameForFile('A047C012.mov', '', 3)).toBe('A047C012')
+    expect(uploadNameForFile('A047C012.mov', 'Scene 4', 3)).toBe('A047C012')
+  })
+
+  it('lets a typed name win only when it can mean one file', () => {
+    expect(uploadNameForFile('A047C012.mov', 'Scene 4', 1)).toBe('Scene 4')
+    expect(uploadNameForFile('A047C012.mov', '   ', 1)).toBe('A047C012')
+    expect(uploadNameForFile('A047C012.mov', '', 1)).toBe('A047C012')
+  })
+
+  it('keeps a name that is nothing but an extension', () => {
+    expect(uploadNameForFile('.gitignore', '', 2)).toBe('.gitignore')
   })
 })

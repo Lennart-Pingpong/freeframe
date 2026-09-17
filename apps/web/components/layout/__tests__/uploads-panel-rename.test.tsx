@@ -169,3 +169,41 @@ describe('rows the panel does not offer a rename on', () => {
     expect(screen.queryByRole('button', { name: 'Rename A047C012' })).toBeNull()
   })
 })
+
+describe('where the history flag comes from', () => {
+  // The guards above are pinned; the thing that sets the flag was not. Deleting
+  // `fromHistory: true` from `mergeHistoryAssets` left the whole suite green
+  // while, in the app, every row on the Complete tab grew a pencil that answers
+  // 403 for anyone reviewing a project they are not an editor on. So this test
+  // goes through `/me/assets` rather than building the row by hand.
+  beforeEach(() => vi.clearAllMocks())
+
+  it('marks a row that came back from /me/assets', async () => {
+    vi.mocked(api.get).mockResolvedValue([
+      {
+        id: 'a9',
+        name: 'Someone elses cut',
+        project_id: 'p2',
+        asset_type: 'video',
+        latest_version: {
+          id: 'v9',
+          processing_status: 'ready',
+          created_at: new Date().toISOString(),
+          files: [{ original_filename: 'B012.mov', file_size_bytes: 2048, mime_type: 'video/quicktime' }],
+        },
+      },
+    ])
+
+    useUploadStore.setState({ files: [], panelOpen: true, historyLoaded: false, historyHasMore: true })
+    await useUploadStore.getState().fetchHistory()
+
+    const produced = useUploadStore.getState().files.find((f) => f.assetId === 'a9')
+    expect(produced).toBeTruthy()
+
+    render(<UploadsPanel />)
+    fireEvent.click(screen.getByRole('button', { name: /Complete/ }))
+
+    expect(screen.getByText('Someone elses cut')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Rename Someone elses cut' })).toBeNull()
+  })
+})

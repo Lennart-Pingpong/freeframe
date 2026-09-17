@@ -115,4 +115,47 @@ describe('a rename made while initiate is in flight', () => {
     const row = useUploadStore.getState().files.find((f) => f.id === id)
     expect(row?.status).not.toBe('failed')
   })
+
+  it('puts the refused name back and says why', async () => {
+    // Swallowing it left the row showing a name the asset never took, for the
+    // rest of the session, while the grid, search and the share link all
+    // showed the old one -- with nothing on screen to say so, because this
+    // correction is sent without a click behind it.
+    const held = gate<void>()
+    mockUpload(held.promise)
+    vi.mocked(api.patch).mockRejectedValue(new Error('Name too long'))
+
+    const id = useUploadStore.getState().startUpload(file(), 'p1', 'Rushes', 'Season 2', null)
+    await settle()
+    await useUploadStore.getState().renameUpload(id, 'Ep04')
+    held.open()
+    await settle()
+
+    const row = useUploadStore.getState().files.find((f) => f.id === id)
+    expect(row?.assetName).toBe('Rushes')
+    expect(row?.renameError).toBe('Name too long')
+  })
+
+  it('lets the same name be retried after a refusal', async () => {
+    // `renameUpload` returns early when the typed name equals the row's, so a
+    // row left holding the refused name answered a retry of it with silence.
+    const held = gate<void>()
+    mockUpload(held.promise)
+    vi.mocked(api.patch).mockRejectedValue(new Error('boom'))
+
+    const id = useUploadStore.getState().startUpload(file(), 'p1', 'Rushes', 'Season 2', null)
+    await settle()
+    await useUploadStore.getState().renameUpload(id, 'Ep04')
+    held.open()
+    await settle()
+
+    vi.mocked(api.patch).mockResolvedValue({} as never)
+    vi.mocked(api.patch).mockClear()
+    await useUploadStore.getState().renameUpload(id, 'Ep04')
+
+    expect(api.patch).toHaveBeenCalledWith('/assets/a1', { name: 'Ep04' })
+    const row = useUploadStore.getState().files.find((f) => f.id === id)
+    expect(row?.assetName).toBe('Ep04')
+    expect(row?.renameError).toBeUndefined()
+  })
 })

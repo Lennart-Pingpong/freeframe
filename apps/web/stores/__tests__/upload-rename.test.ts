@@ -103,6 +103,23 @@ describe('renaming a row that is uploading', () => {
     expect(matcher(null)).toBe(false)
   })
 
+  it('revalidates without blanking what is on screen first', async () => {
+    // swr short-circuits to a pure revalidate only below three arguments. With
+    // three it falls through to `populateCache`, which defaults to true, and
+    // writes `undefined` into every matching key before refetching: the grid
+    // behind the panel becomes skeletons for the length of the refetch, and
+    // the review screen's comment list reads "No comments yet", because
+    // `use-comments` does `data ?? []` and the page passes no `isLoading`.
+    // Both forms revalidate, so the extra arguments only buy the blank.
+    vi.mocked(api.patch).mockResolvedValue({})
+    seed(row())
+
+    await useUploadStore.getState().renameUpload('row-1', 'Ep04')
+
+    expect(mutateSpy).toHaveBeenCalledTimes(1)
+    expect(mutateSpy.mock.calls[0]).toHaveLength(1)
+  })
+
   it('puts the old name back when the server refuses', async () => {
     // The row is renamed before the request goes out, because leaving the old
     // name up for a round trip reads as the edit not having taken.

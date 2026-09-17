@@ -30,6 +30,7 @@ import {
   formatRelativeTime,
   formatBytes,
   assetNameFromFile,
+  uploadNameForFile,
 } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -402,10 +403,7 @@ export default function ProjectDetailPage() {
 
   const handleStartUpload = () => {
     pendingFiles.forEach((file) => {
-      const name =
-        pendingFiles.length === 1
-          ? assetName || assetNameFromFile(file.name)
-          : assetNameFromFile(file.name);
+      const name = uploadNameForFile(file.name, assetName, pendingFiles.length);
       // Note: startUpload does not yet accept folderId — assets will upload to root.
       // Upload store needs to be updated in a future task to support folder placement.
       startUpload(file, projectId, name, project?.name, currentFolderId);

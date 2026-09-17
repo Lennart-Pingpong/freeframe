@@ -252,9 +252,14 @@ function UploadItem({ upload }: { upload: UploadFile }) {
             <span className="text-[11px] text-status-error truncate">{upload.error}</span>
           )}
           {/* The name has already snapped back by the time this shows, which
-              says something went wrong but not what. */}
-          {renameError && (
-            <span className="text-[11px] text-status-error truncate">{renameError}</span>
+              says something went wrong but not what. `upload.renameError` is
+              the same thing for a correction the store sent on its own, during
+              the initiate round trip, where there was no click to report back
+              to. The local one wins: it belongs to the edit just made. */}
+          {(renameError ?? upload.renameError) && (
+            <span className="text-[11px] text-status-error truncate">
+              {renameError ?? upload.renameError}
+            </span>
           )}
         </div>
       </div>

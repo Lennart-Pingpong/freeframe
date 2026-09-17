@@ -190,3 +190,22 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 export function assetNameFromFile(fileName: string): string {
   return fileName.replace(/\.[^/.]+$/, "") || fileName
 }
+
+/**
+ * The name one file of a selection is uploaded under.
+ *
+ * A name typed into the upload dialog belongs to one file. With several
+ * selected there is one field and no way to say which of them it names, so
+ * each keeps its own -- otherwise picking three clips and typing nothing
+ * uploaded them as `A047C012.mov`, extension and all, while picking one gave
+ * `A047C012`, because the field had been prefilled with the stripped name and
+ * the multi-file path read the raw filename instead.
+ */
+export function uploadNameForFile(
+  fileName: string,
+  typedName: string,
+  fileCount: number,
+): string {
+  if (fileCount === 1) return typedName.trim() || assetNameFromFile(fileName)
+  return assetNameFromFile(fileName)
+}
