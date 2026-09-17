@@ -504,8 +504,13 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             <ArrowLeft className="h-4 w-4" />
           </Link>
 
-          {/* Asset name only */}
-          <span className="text-[13px] text-text-primary font-medium truncate">
+          {/* Asset name only. Truncated, so it needs a title: this is the only
+              place the full name is shown, and it is the first thing the bar
+              gives up when the window is narrow. */}
+          <span
+            className="text-[13px] text-text-primary font-medium truncate"
+            title={asset.name}
+          >
             {asset.name}
           </span>
         </div>
@@ -516,8 +521,21 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             to be absolutely positioned at the middle of the bar, and the
             navigator lands there too -- the blocks either side of it are both
             flex-1 -- so on any asset with a neighbour "Powered by FreeFrame"
-            was drawn straight across "5 of 7". With no neighbour the navigator
-            is not rendered and the credit is centred alone, as before. */}
+            was drawn straight across "5 of 7", and won the hit test on the
+            chevron. What is centred now is the group: with a neighbour the
+            navigator therefore sits a little left of the bar's centre line,
+            which is the cost of the two not overlapping. With no neighbour the
+            navigator is not rendered and the credit is centred alone, exactly
+            as before.
+
+            The credit is `hidden` below `lg` because in flow it is 147px that
+            nothing can reclaim: the middle group does not shrink, and neither
+            does the block on the right, so the surplus leaves the bar past its
+            right edge, where the page root's `overflow-hidden` clips it and no
+            scroll reaches it. That costs the sidebar toggle from about 744px
+            down -- an iPad in portrait, or two windows side by side. Out of
+            flow below `lg`, the thresholds are the ones this page had before
+            the credit joined the bar at all. */}
         <div className="flex items-center gap-3 shrink-0">
           {totalAssets > 1 && (
             <div className="flex items-center gap-1 shrink-0">
@@ -542,7 +560,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
               </button>
             </div>
           )}
-          <PoweredByBadge showIcon />
+          <PoweredByBadge showIcon className="hidden lg:inline-flex" />
         </div>
 
         {/* Right: version, share, sidebar toggle */}
