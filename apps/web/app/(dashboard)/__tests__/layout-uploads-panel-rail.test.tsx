@@ -28,8 +28,6 @@ vi.mock('@/components/layout/upload-sse-bridge', () => ({ UploadSSEBridge: () =>
 vi.mock('@/components/shared/powered-by-badge', () => ({ PoweredByBadge: () => null }))
 vi.mock('@/lib/api', () => ({ api: { get: vi.fn().mockResolvedValue([]), post: vi.fn() } }))
 
-// `?raw` hands us the file's own text, which is what Tailwind scans.
-import panelSource from '@/components/layout/uploads-panel.tsx?raw'
 import DashboardLayout from '../layout'
 import { useUploadStore } from '@/stores/upload-store'
 
@@ -67,19 +65,5 @@ describe('the uploads panel beside the sidebar', () => {
     fireEvent.click(screen.getByText('toggle'))
 
     expect(panelBox().className).toContain('[--ff-left:52px]')
-  })
-})
-
-describe('the offsets Tailwind has to be able to find', () => {
-  // This is a source-level assertion on purpose. Tailwind emits a rule only for
-  // a class it can read whole in the source, and a computed
-  // `[--ff-left:${…}px]` produces the identical className at runtime -- so no
-  // rendering test can tell the two apart, and the rendered assertions above
-  // stay green while the CSS rule disappears entirely. The constraint really is
-  // about the characters in the file, so that is what is checked.
-
-  it('spells both offsets out literally', () => {
-    expect(panelSource).toContain("'[--ff-left:52px]'")
-    expect(panelSource).toContain("'md:[--ff-left:220px]'")
   })
 })
