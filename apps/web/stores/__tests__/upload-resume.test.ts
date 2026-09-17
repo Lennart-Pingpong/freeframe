@@ -200,6 +200,39 @@ describe('resumeUpload', () => {
     expect(completionBody().upload_id).toBe('u1')
   })
 
+  it('records the upload id it was given, so a second interruption can resume too', async () => {
+    // The row seeded here has no upload id, which is the normal shape of a row
+    // this browser only knows from `/me/assets` or got back after storage was
+    // cleared -- and those are exactly the rows this feature exists for.
+    // Without writing it down, `standingOfStoredRow` reads the row as a
+    // transfer that broke before initiate answered and fails it: the panel
+    // offers a failed row nothing but Dismiss, and re-uploading instead
+    // strands the multipart upload until the reaper.
+    expect(rowOf('row-1').uploadId).toBeUndefined()
+
+    useUploadStore.getState().resumeUpload('row-1', makeFile())
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('processing'))
+
+    expect(rowOf('row-1').uploadId).toBe('u1')
+    expect(rowOf('row-1').versionId).toBe(VERSION_ID)
+  })
+
+  it('leaves a resumed row that breaks again resumable, not failed', async () => {
+    // The whole point of recording it: this is the same rehydration the fresh
+    // upload paths already survive.
+    vi.mocked(api.get).mockResolvedValue(resumeInfo({ held_part_numbers: [1, 2] }) as never)
+    useUploadStore.getState().resumeUpload('row-1', makeFile())
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('processing'))
+
+    const opts = (useUploadStore as unknown as {
+      persist: { getOptions: () => { merge?: (p: unknown, c: unknown) => { files: UploadFile[] } } }
+    }).persist.getOptions()
+    const stored = { ...rowOf('row-1'), status: 'uploading' as const }
+    const [rehydrated] = opts.merge!({ files: [stored] }, { files: [] }).files
+
+    expect(rehydrated.status).toBe('interrupted')
+  })
+
   it('reports no parts list when it skipped some', async () => {
     // The list is only read by a backend that cannot list its own parts, and a
     // resumed upload cannot produce a complete one: it never saw the ETags of
@@ -584,12 +617,37 @@ describe('a row that was uploading when the tab reloaded', () => {
     expect(row.uploadId).toBe('u1')
   })
 
-  it('is failed, not interrupted, when it never got an upload id', () => {
+  it('is failed, not interrupted, when it never got a version', () => {
     // Nothing to come back to: the same rule the upload loop applies when a
     // transfer breaks before initiate has answered.
     const [row] = rehydrate([{ ...inFlight, versionId: undefined, uploadId: undefined }])
 
     expect(row.status).toBe('failed')
+  })
+
+  it('is failed when it was sending and has no upload id, version or not', () => {
+    // Each half of that condition stands on its own: a row can carry a version
+    // id and no upload id, because the two are written in separate calls.
+    // Tested apart from the case above, where the missing version id answers
+    // first and hides whether the upload id is looked at at all.
+    const [row] = rehydrate([{ ...inFlight, uploadId: undefined }])
+
+    expect(row.status).toBe('failed')
+  })
+
+  it('does not fail an elsewhere row for having no upload id', () => {
+    // A row from `/me/assets` never carries one -- the resume asks the server
+    // -- so applying the rule to it turned an upload still running on another
+    // device into a dead "Failed" on the next load.
+    const [row] = rehydrate([{
+      ...inFlight,
+      status: 'elsewhere',
+      uploadId: undefined,
+      ownerTab: 'another-tab',
+      heartbeatAt: Date.now(),
+    }])
+
+    expect(row.status).toBe('elsewhere')
   })
 
   it('leaves the rows it did not write alone', () => {

@@ -1,5 +1,5 @@
 import { create, type StateCreator } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { persist, createJSONStorage } from 'zustand/middleware'
 import { api, ApiError } from '@/lib/api'
 import type { AssetResponse } from '@/types'
 
@@ -97,11 +97,57 @@ function storedHeartbeat(fileId: string): number | undefined {
   }
 }
 
-/** Whether the server has seen this upload move too recently to be touched from
- *  here. Only asked for a row this tab did not start: this tab knows whether it
- *  is still sending its own. */
-function activeElsewhere(row: UploadFile, info: ResumeInfo, now: number): boolean {
-  if (row.ownerTab === currentTabId()) return false
+/**
+ * How long after this tab's own last heartbeat its row still counts as its
+ * own business, rather than something the server has to be asked about.
+ *
+ * Two heartbeats. Long enough to cover the case it exists for -- this tab was
+ * sending a moment ago and the transfer dropped -- and short enough that it
+ * has passed by the time anyone could plausibly have picked the upload up
+ * somewhere else.
+ */
+const OWN_STOP_GRACE_MS = HEARTBEAT_MS * 2
+
+/**
+ * Whether the server has seen this upload move too recently to be touched from
+ * here.
+ *
+ * The exemption is for an upload this tab is responsible for, and that is a
+ * fact about this tab's own memory rather than about a persisted id. Keying it
+ * on `ownerTab` alone was wrong in a way that costs data: a tab whose transfer
+ * died still carries its own id on the row, so when the user picked the upload
+ * up on their phone, the laptop tab -- never reloaded -- went on offering
+ * Discard and the server had no guard of its own. The multipart upload was
+ * aborted, the objects deleted, the version soft-deleted, and the phone then
+ * got a 403 on its next presign.
+ *
+ * So: this tab is sending it now, or it stopped sending it just now. Both are
+ * read from this browser's own clock (`heartbeatAt` is written here, by the
+ * tab doing the work), so no server timestamp is compared against a local one
+ * and the skew in `liveUntil` is not made worse.
+ *
+ * What this cannot do is tell "my own transfer dropped five seconds ago" from
+ * "my transfer dropped and another device has already taken over", because
+ * from one snapshot those are the same row. The grace above is where that
+ * trade sits: inside it the user keeps control of an upload that has just
+ * stopped under them, outside it the server decides.
+ */
+function activeElsewhere(
+  row: UploadFile,
+  info: ResumeInfo,
+  now: number,
+  attempt?: AbortController,
+): boolean {
+  // `attempt` is the caller's own controller, where the caller is the one
+  // trying to start a transfer: `resumeUpload` registers it before it asks the
+  // server anything, so without excluding it here every resume would count as
+  // this tab already sending and the guard would never refuse.
+  if (isSendingHere(row.id, attempt)) return false
+  const ownAndRecent =
+    row.ownerTab === currentTabId() &&
+    row.heartbeatAt !== undefined &&
+    now - row.heartbeatAt < OWN_STOP_GRACE_MS
+  if (ownAndRecent) return false
   const until = liveUntil(info.last_activity_at)
   return until !== undefined && now < until
 }
@@ -533,6 +579,19 @@ function isFinalRefusal(err: unknown): boolean {
 
 // AbortControllers for cancellation
 const abortControllers: Record<string, AbortController> = {}
+
+/**
+ * Whether this tab is pushing bytes for this row right now.
+ *
+ * The one signal that cannot be stale. Every transfer removes its controller in
+ * a `finally`, so the entry exists for exactly as long as the transfer does --
+ * unlike `ownerTab`, which a row keeps carrying after the transfer behind it
+ * has died, and across a reload that killed it.
+ */
+function isSendingHere(fileId: string, except?: AbortController): boolean {
+  const running = abortControllers[fileId]
+  return running !== undefined && running !== except
+}
 
 /** Claims a row for this tab and keeps stamping it until the returned stop is
  *  called. Written through the store, so it reaches shared storage the same way
@@ -1038,7 +1097,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 
         // Two tabs sending the same part numbers into one multipart upload leave
         // the completing tab with ETags that no longer match what is stored.
-        if (activeElsewhere(row, info, Date.now())) {
+        if (activeElsewhere(row, info, Date.now(), controller)) {
           const refusedAt = info.last_activity_at
           info = undefined
           if (get().files.find((f) => f.id === fileId)?.status !== 'cancelled') {
@@ -1051,6 +1110,24 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           return
         }
         stopBeat = beatFor(updateFile)
+
+        // The upload id belongs on the row, not only in this closure. A row
+        // without one is read as a transfer that broke before initiate
+        // answered, so `standingOfStoredRow` fails it -- and a resumed row
+        // interrupted again mid-transfer came back as "Upload interrupted"
+        // with nothing but Dismiss, which is precisely the row this feature
+        // exists for: one this browser only knows from `/me/assets`, or one
+        // whose storage was cleared. It is recoverable by dismissing and
+        // reloading, and nobody would guess that.
+        //
+        // The version and asset ids go with it, for the same reason: the two
+        // fresh upload paths record all three in one call and this one
+        // recorded none of them.
+        updateFile({
+          uploadId: info.upload_id,
+          versionId: info.version_id,
+          assetId: info.asset_id,
+        })
 
         // `assembled` means the object is whole and only the completion is
         // outstanding, so the file is not needed and is not checked -- refusing
@@ -1366,12 +1443,32 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           // reaper. This is the guard `completedVersionStatus` carries for the
           // same reason -- the second half of #273.
           if (!f.versionId || asset.latest_version.id !== f.versionId) return f
-          const status = mapProcessingStatus(asset.latest_version.processing_status)
+          // An upload still running on another device reads as `uploading`
+          // here, which maps to `interrupted` -- the same status the row
+          // already has, so the early return below kept it there for good. The
+          // row went on offering Resume and Discard for a transfer that was
+          // very much alive, which is the opposite of what `elsewhere` exists
+          // to say, and `last_activity_at` was sitting in the payload that had
+          // just been fetched. Judged the way `mergeHistoryAssets` judges it,
+          // so history and the poll cannot disagree about the same version.
+          const version = asset.latest_version
+          const movingUntil = version.processing_status === 'uploading'
+            ? liveUntil(version.last_activity_at)
+            : undefined
+          const stillMoving = movingUntil !== undefined && Date.now() < movingUntil
+          const status = stillMoving
+            ? ('elsewhere' as const)
+            : mapProcessingStatus(version.processing_status)
+          // No `&& !stillMoving` guard here: `watched` only collects
+          // `processing` and `interrupted` rows, so a `stillMoving` row is
+          // always changing status and can never reach this comparison equal.
           if (status === f.status) return f
+          const keepsProgress = status === 'interrupted' || status === 'elsewhere'
           return {
             ...f,
             status,
-            progress: status === 'interrupted' ? f.progress : 100,
+            elsewhereUntil: stillMoving ? movingUntil : f.elsewhereUntil,
+            progress: keepsProgress ? f.progress : 100,
             processingProgress: status === 'complete' ? 100 : 0,
           }
         }),
@@ -1382,9 +1479,81 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
   },
 })
 
+/**
+ * Merges what this tab is about to write with what is already in storage.
+ *
+ * `ff-uploads` is one key shared by every tab of the origin, and zustand's
+ * persist rewrites the whole of it from this tab's own `files` after every
+ * `set` -- so without this, a tab that is only *watching* another tab's upload
+ * publishes its own frozen copy of that row over the live one. Measured: a
+ * store holding tab A's row as `elsewhere` with a three-minute-old stamp, and
+ * `ff-uploads` freshly stamped by A less than two seconds ago; one ordinary
+ * `setPanelOpen(true)` in tab B rolled the stored stamp back three minutes, and
+ * the very next sweep called the transfer interrupted. The row left the Active
+ * group for Failed, gained Resume and Discard, and never came back.
+ *
+ * Two rules, and both are the same idea: a row belongs to the tab that is
+ * sending it.
+ *
+ *  * A row this tab does not own is kept as stored whenever the stored copy was
+ *    stamped at least as recently. This tab has nothing newer to say about it.
+ *  * A row that is in storage and not in this tab's state at all is kept, as
+ *    long as another tab is still stamping it. Otherwise one tab's write erases
+ *    another tab's in-flight row outright -- and if that tab then dies, history
+ *    answers with the display version, which skips `uploading`, so a second
+ *    version's upload has no row anywhere and no offer to resume.
+ *
+ * A row this tab owns is always written as this tab has it: nobody else is in a
+ * position to know better.
+ */
+function mergeWithStored(name: string, outgoing: string): string {
+  try {
+    const raw = window.localStorage.getItem(name)
+    if (!raw) return outgoing
+    const parsed = JSON.parse(outgoing) as { state?: { files?: UploadFile[] } }
+    const stored = (JSON.parse(raw) as { state?: { files?: UploadFile[] } }).state?.files
+    const ours = parsed.state?.files
+    if (!stored?.length || !ours) return outgoing
+
+    const mine = currentTabId()
+    const now = Date.now()
+    const byId = new Map(ours.map((f) => [f.id, f]))
+
+    for (const row of stored) {
+      const here = byId.get(row.id)
+      if (!here) {
+        const beating = row.heartbeatAt !== undefined && now - row.heartbeatAt < LIVE_WINDOW_MS
+        if (row.ownerTab && row.ownerTab !== mine && beating) byId.set(row.id, row)
+        continue
+      }
+      if (here.ownerTab === mine) continue
+      if ((row.heartbeatAt ?? 0) >= (here.heartbeatAt ?? 0)) byId.set(row.id, row)
+    }
+
+    // Array.from rather than a spread: this repo's target does not allow
+    // iterating a Map without downlevelIteration.
+    parsed.state!.files = Array.from(byId.values())
+    return JSON.stringify(parsed)
+  } catch {
+    // Storage unreadable or holding something this build does not understand.
+    // Writing this tab's own view is what happened before there was a merge at
+    // all, and it is better than not persisting.
+    return outgoing
+  }
+}
+
 export const useUploadStore = create<UploadStore>()(
   persist(storeCreator, {
     name: 'ff-uploads',
+    // Every write goes through the merge above. It costs one read and one parse
+    // of a list that holds a handful of rows, against a `set` that has already
+    // re-rendered the panel.
+    storage: createJSONStorage(() => ({
+      getItem: (name: string) => window.localStorage.getItem(name),
+      setItem: (name: string, value: string) =>
+        window.localStorage.setItem(name, mergeWithStored(name, value)),
+      removeItem: (name: string) => window.localStorage.removeItem(name),
+    })),
     // Terminal rows plus everything that can still be carried on. Successful
     // uploads are fetched from the API history on panel open, so they are not
     // kept here.

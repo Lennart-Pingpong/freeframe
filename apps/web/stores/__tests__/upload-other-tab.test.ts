@@ -212,12 +212,40 @@ describe('discarding or resuming an upload that is still moving somewhere else',
   it('discards this tab\'s own row without waiting, since this tab knows it stopped', async () => {
     // A network drop a few seconds ago is recent activity too. Refusing here
     // would lock the user out of their own upload for the length of the window.
-    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: currentTabId() })] })
+    // With the heartbeat this tab wrote while it was sending: a row it owns
+    // always has one, and it is what says how long ago this tab stopped.
+    useUploadStore.setState({
+      files: [row({ status: 'interrupted', ownerTab: currentTabId(), heartbeatAt: Date.now() })],
+    })
     vi.mocked(api.get).mockResolvedValue(resumeInfo(secondsAgo(5)) as never)
 
     await useUploadStore.getState().discardUpload('row-1')
 
     expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ discard: true }))
+  })
+
+  it('refuses to discard an upload another device has taken over', async () => {
+    // The row still carries this tab's id, because this tab started the
+    // transfer -- and then it died, its catch wrote `interrupted`, and the user
+    // picked the upload up on their phone. Keying the exemption on that id let
+    // the laptop abort the multipart upload, delete the objects and soft-delete
+    // the version, after which the phone got a 403 on its next presign. The tab
+    // stopped stamping when its transfer died, so its own heartbeat is what
+    // says it is no longer the one sending.
+    useUploadStore.setState({
+      files: [row({
+        status: 'interrupted',
+        ownerTab: currentTabId(),
+        heartbeatAt: Date.now() - 10 * 60 * 1000,
+      })],
+    })
+    vi.mocked(api.get).mockResolvedValue(resumeInfo(secondsAgo(2)) as never)
+
+    const refused = await useUploadStore.getState().discardUpload('row-1')
+
+    expect(refused).toMatch(/another tab or on another device/)
+    expect(api.post).not.toHaveBeenCalledWith('/upload/abort', expect.anything())
+    expect(rowOf('row-1').status).toBe('elsewhere')
   })
 
   it('does not resume into an upload another tab is still sending parts into', async () => {
@@ -387,5 +415,161 @@ describe('cancelling an upload', () => {
     expect(api.post).toHaveBeenCalledWith('/upload/abort', {
       s3_key: 'raw/k', upload_id: 'u1', version_id: VERSION_ID, discard: true,
     })
+  })
+})
+
+// ------------------------------------------------- what this tab may overwrite
+
+describe('writing to storage every tab shares', () => {
+  const KEY = 'ff-uploads'
+
+  /** The storage zustand actually writes through, merge and all. */
+  function storage() {
+    return (useUploadStore as unknown as {
+      persist: { getOptions: () => { storage: {
+        setItem: (name: string, value: unknown) => void
+      } } }
+    }).persist.getOptions().storage
+  }
+
+  function seedStorage(files: Partial<UploadFile>[]) {
+    window.localStorage.setItem(KEY, JSON.stringify({
+      state: { files: files.map((f) => row(f)) }, version: 0,
+    }))
+  }
+
+  function storedFiles(): UploadFile[] {
+    return JSON.parse(window.localStorage.getItem(KEY)!).state.files
+  }
+
+  function write(files: Partial<UploadFile>[]) {
+    storage().setItem(KEY, { state: { files: files.map((f) => row(f)) }, version: 0 })
+  }
+
+  beforeEach(() => window.localStorage.clear())
+
+  it('does not roll back a heartbeat another tab wrote more recently', () => {
+    // The whole reason the sweep reads storage rather than the row it hydrated.
+    // Persist rewrites the entire key from this tab's own files after every
+    // `set`, so without the merge one `setPanelOpen(true)` republished this
+    // tab's three-minute-old copy of a row another tab had stamped two seconds
+    // ago -- and the next sweep called that live transfer interrupted.
+    const fresh = Date.now()
+    seedStorage([{ id: 'row-1', ownerTab: 'tab-A', heartbeatAt: fresh }])
+
+    write([{ id: 'row-1', ownerTab: 'tab-A', heartbeatAt: fresh - 3 * 60 * 1000 }])
+
+    expect(storedFiles()[0].heartbeatAt).toBe(fresh)
+  })
+
+  it('writes its own rows as it has them', () => {
+    // Nobody else is in a position to know better about a row this tab sends.
+    const old = Date.now() - 60_000
+    seedStorage([{ id: 'row-1', ownerTab: currentTabId(), heartbeatAt: old }])
+
+    const now = Date.now()
+    write([{ id: 'row-1', ownerTab: currentTabId(), heartbeatAt: now, progress: 88 }])
+
+    expect(storedFiles()[0].heartbeatAt).toBe(now)
+    expect(storedFiles()[0].progress).toBe(88)
+  })
+
+  it('keeps its own update when the stamp has not moved since the last write', () => {
+    // Most writes fall between two heartbeats and carry the same stamp as the
+    // copy already in storage. Deciding those on the stamp alone would send
+    // every one of them back to what was stored: progress, status and the
+    // upload id all frozen at whatever the last beat happened to catch.
+    const beat = Date.now()
+    seedStorage([{ id: 'row-1', ownerTab: currentTabId(), heartbeatAt: beat, progress: 10 }])
+
+    write([{ id: 'row-1', ownerTab: currentTabId(), heartbeatAt: beat, progress: 50 }])
+
+    expect(storedFiles()[0].progress).toBe(50)
+  })
+
+  it('does not erase a row another tab is still sending', () => {
+    // A tab that never had the row must not publish its absence. If the sending
+    // tab then dies, history answers with the display version, which skips
+    // `uploading`, so a second version's upload would have no row anywhere.
+    seedStorage([{ id: 'row-1', ownerTab: 'tab-A', heartbeatAt: Date.now() }])
+
+    write([])
+
+    expect(storedFiles().map((f) => f.id)).toEqual(['row-1'])
+  })
+
+  it('lets a row that nobody is sending be removed', () => {
+    // Otherwise Discard, Dismiss and "clear completed" could never take effect.
+    seedStorage([{ id: 'row-1', ownerTab: 'tab-A', heartbeatAt: Date.now() - LIVE_WINDOW_MS - 1 }])
+
+    write([])
+
+    expect(storedFiles()).toEqual([])
+  })
+
+  it('lets this tab remove its own row', () => {
+    seedStorage([{ id: 'row-1', ownerTab: currentTabId(), heartbeatAt: Date.now() }])
+
+    write([])
+
+    expect(storedFiles()).toEqual([])
+  })
+})
+
+// ------------------------------------- the poll, for a transfer on another device
+
+describe('polling a row whose upload is running on another device', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.localStorage.clear()
+  })
+
+  function assetStillUploading(lastActivity: Date) {
+    return {
+      id: ASSET_ID,
+      latest_version: {
+        id: VERSION_ID,
+        processing_status: 'uploading',
+        last_activity_at: lastActivity.toISOString(),
+      },
+    }
+  }
+
+  it('turns an interrupted row back into elsewhere while the other device sends', async () => {
+    // The sweep can only see heartbeats from other tabs of this browser, so a
+    // transfer on a phone falls out of `elsewhere` about a window after history
+    // was fetched. The poll had the answer in its hand and threw it away: the
+    // version reads `uploading`, which maps to `interrupted`, which is what the
+    // row already said -- so the early return fired and the row kept offering
+    // Resume and Discard for an upload that was still running.
+    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined })] })
+    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('elsewhere')
+    expect(rowOf('row-1').elsewhereUntil).toBeGreaterThan(Date.now())
+  })
+
+  it('leaves it interrupted once the other device has stopped', async () => {
+    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined })] })
+    vi.mocked(api.get).mockResolvedValue(
+      assetStillUploading(new Date(Date.now() - LIVE_WINDOW_MS - 1000)) as never,
+    )
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('interrupted')
+  })
+
+  it('keeps the progress it had rather than jumping to 100', async () => {
+    useUploadStore.setState({
+      files: [row({ status: 'interrupted', ownerTab: undefined, progress: 41 })],
+    })
+    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').progress).toBe(41)
   })
 })
