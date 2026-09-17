@@ -265,9 +265,16 @@ export function UploadsPanel({
         // opened on top of it and cut every label back to its first letter --
         // the very labels expanding the sidebar is for. Both widths are spelled
         // out because Tailwind only generates classes it can find whole.
+        //
+        // The offset is gated at `md` because the panel is a hard 380px: on a
+        // phone, 220 + 380 is wider than the screen, and nothing can scroll to
+        // what falls off, so the close button and the tab bar would simply be
+        // unreachable. The rail only expands by hand and does not persist, so
+        // below `md` the panel stays where a collapsed rail puts it.
         className={cn(
           'fixed left-safe top-0 z-50 h-dvh w-[380px]',
-          railCollapsed ? '[--ff-left:52px]' : '[--ff-left:220px]',
+          '[--ff-left:52px]',
+          !railCollapsed && 'md:[--ff-left:220px]',
           'border-r border-border bg-bg-secondary shadow-2xl flex flex-col pb-safe animate-in slide-in-from-left-4 duration-150',
         )}
       >

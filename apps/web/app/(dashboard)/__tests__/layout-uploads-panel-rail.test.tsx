@@ -28,6 +28,8 @@ vi.mock('@/components/layout/upload-sse-bridge', () => ({ UploadSSEBridge: () =>
 vi.mock('@/components/shared/powered-by-badge', () => ({ PoweredByBadge: () => null }))
 vi.mock('@/lib/api', () => ({ api: { get: vi.fn().mockResolvedValue([]), post: vi.fn() } }))
 
+// `?raw` hands us the file's own text, which is what Tailwind scans.
+import panelSource from '@/components/layout/uploads-panel.tsx?raw'
 import DashboardLayout from '../layout'
 import { useUploadStore } from '@/stores/upload-store'
 
@@ -42,6 +44,7 @@ describe('the uploads panel beside the sidebar', () => {
     render(<DashboardLayout><div>page</div></DashboardLayout>)
 
     expect(panelBox().className).toContain('[--ff-left:52px]')
+    expect(panelBox().className).not.toContain('md:[--ff-left:220px]')
   })
 
   it('moves out to the expanded sidebar\'s edge instead of covering it', () => {
@@ -50,7 +53,33 @@ describe('the uploads panel beside the sidebar', () => {
 
     fireEvent.click(screen.getByText('toggle'))
 
-    expect(panelBox().className).toContain('[--ff-left:220px]')
-    expect(panelBox().className).not.toContain('[--ff-left:52px]')
+    expect(panelBox().className).toContain('md:[--ff-left:220px]')
+  })
+
+  it('keeps the collapsed offset as the base, so a phone never loses the panel', () => {
+    // The panel is a hard 380px. 220 + 380 is wider than a phone, the page
+    // root does not scroll sideways, and there is no gesture that reaches what
+    // falls off -- so with the offset ungated the close button and the whole
+    // tab bar sit outside the screen with only a backdrop tap to escape.
+    useUploadStore.setState({ files: [], panelOpen: true, historyLoaded: true, historyHasMore: false })
+    render(<DashboardLayout><div>page</div></DashboardLayout>)
+
+    fireEvent.click(screen.getByText('toggle'))
+
+    expect(panelBox().className).toContain('[--ff-left:52px]')
+  })
+})
+
+describe('the offsets Tailwind has to be able to find', () => {
+  // This is a source-level assertion on purpose. Tailwind emits a rule only for
+  // a class it can read whole in the source, and a computed
+  // `[--ff-left:${…}px]` produces the identical className at runtime -- so no
+  // rendering test can tell the two apart, and the rendered assertions above
+  // stay green while the CSS rule disappears entirely. The constraint really is
+  // about the characters in the file, so that is what is checked.
+
+  it('spells both offsets out literally', () => {
+    expect(panelSource).toContain("'[--ff-left:52px]'")
+    expect(panelSource).toContain("'md:[--ff-left:220px]'")
   })
 })
