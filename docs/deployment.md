@@ -273,6 +273,8 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `TRANSCODER_PIPELINE` | GPU backend: `Auto`, `NVIDIA`, `Intel`, or `Software` | `Auto` |
 | `TRANSCODER_OUTPUT` | Output codec: `h264_8` (broad compatibility) or `h265_10` (HEVC 10-bit) | `h264_8` |
 | `TRANSCODER_HDR` | `convert` (tone-map HDR to SDR) or `preserve` (keep HDR tags) | `convert` |
+| `TRANSCODER_QUALITIES` | Ladder rungs to build. Rungs above the source are dropped | `1080p,720p,360p` |
+| `TRANSCODER_SOURCE_COPY` | Package an already browser-safe source into HLS without re-encoding, where the ladder above resolves to one rendition at the source's own size | `false` |
 
 ---
 

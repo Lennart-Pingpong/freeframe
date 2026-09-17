@@ -26,20 +26,62 @@ def _transcode(
     video_stream: dict | None = None,
     audio_streams: list[dict] | None = None,
     source_copy: str | None = "true",
+    keyframes: list[float] | None = None,
+    open_gop: bool = False,
+    idrs: int | None = None,
+    remux_fails: bool = False,
+    hls_commands: int = 1,
 ):
-    """Run a transcode with everything mocked; return (hls command, result)."""
+    """Run a transcode with everything mocked; return (hls command, result).
+
+    The keyframe probe is mocked from `keyframes` and `open_gop`: by default a
+    well-behaved master with an IDR every two seconds, which is what a copy
+    needs and what an NLE exports.
+    """
     width, height = source
     stream = {"r_frame_rate": "25/1", "duration": 6.0, "width": width, "height": height}
     stream.update(_H264_8BIT if video_stream is None else video_stream)
+    times = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0] if keyframes is None else keyframes
 
     def run(cmd, **_kwargs):
         mock = MagicMock()
         mock.returncode = 0
         mock.stderr = ""
-        if "-select_streams" in cmd and cmd[cmd.index("-select_streams") + 1] == "v:0":
-            mock.stdout = json.dumps({"streams": [stream]})
-        elif "-select_streams" in cmd and cmd[cmd.index("-select_streams") + 1] == "a":
-            mock.stdout = json.dumps({"streams": audio_streams or []})
+        mock.stdout = ""
+        if cmd[0] == "ffprobe":
+            entries = (
+                cmd[cmd.index("-show_entries") + 1] if "-show_entries" in cmd else ""
+            )
+            selected = (
+                cmd[cmd.index("-select_streams") + 1]
+                if "-select_streams" in cmd else ""
+            )
+            if entries.startswith("packet="):
+                # Sync samples, plus one ordinary frame so the "K" filter is
+                # doing something rather than counting every packet.
+                mock.stdout = json.dumps({"packets": [
+                    *({"pts_time": f"{t:.6f}", "flags": "K_"} for t in times),
+                    {"pts_time": "0.040000", "flags": "__"},
+                ]})
+            elif selected == "v:0":
+                mock.stdout = json.dumps({"streams": [stream]})
+            elif selected == "a":
+                mock.stdout = json.dumps({"streams": audio_streams or []})
+        elif "trace_headers" in cmd:
+            # What ffmpeg -v trace prints per NAL unit. An open-GOP master has
+            # one real IDR and marks its later entry points with a recovery
+            # point instead.
+            lines = ["nal_unit_type: 7(SPS), nal_ref_idc: 3"]
+            idr_units = len(times) if idrs is None else idrs
+            if open_gop:
+                idr_units = 1 if idrs is None else idrs
+                lines += ["recovery_frame_cnt        00000 = 0"] * (len(times) - 1)
+            lines += ["nal_unit_type: 5(IDR), nal_ref_idc: 3"] * idr_units
+            mock.stderr = "\n".join(lines)
+        elif remux_fails and "-f" in cmd and cmd[cmd.index("-f") + 1] == "hls" \
+                and "copy" in cmd:
+            mock.returncode = 1
+            mock.stderr = "Invalid data found when processing input"
         return mock
 
     job = TranscodeJob(
@@ -65,7 +107,9 @@ def _transcode(
         commands = [c[0][0] for c in mock_run.call_args_list]
 
     hls = [c for c in commands if "-f" in c and c[c.index("-f") + 1] == "hls"]
-    assert len(hls) == 1, f"expected one HLS command, got {len(hls)}"
+    assert len(hls) == hls_commands, (
+        f"expected {hls_commands} HLS command(s), got {len(hls)}"
+    )
     return hls[0], result, commands
 
 
@@ -91,6 +135,34 @@ def test_a_rung_above_the_source_copies_too():
     cmd, _, _ = _transcode(["1080p"], source=(1280, 720))
 
     assert _copies(cmd)
+
+
+def test_a_source_that_is_not_16_9_copies_at_its_own_size():
+    # The rung is applied with force_original_aspect_ratio=decrease, so a
+    # 1440x1080 master under `1920:1080` is scaled by exactly 1 and written out
+    # at its own size -- the same rendition a copy would produce. Comparing the
+    # nominal `w:h` strings instead read this as a rung to encode, which hid the
+    # setting from every 4:3 and cinema-ratio master on the instance.
+    for width, height in ((1440, 1080), (1920, 1080), (1920, 804)):
+        cmd, _, _ = _transcode(["1080p"], source=(width, height))
+        assert _copies(cmd), f"{width}x{height} resolves to its own size"
+
+    # A source wider than the rung's box is a different thing and still encodes:
+    # 1998x1080 does not fit inside 1920x1080, so the ladder really is being
+    # asked for a smaller rendition.
+    cmd, _, _ = _transcode(["1080p"], source=(1998, 1080))
+    assert not _copies(cmd)
+
+
+def test_the_copy_writes_the_master_playlist_both_routers_hand_out():
+    # assets.py and share.py both point the player at master.m3u8, and ffmpeg
+    # only writes one when it is asked to.
+    cmd, _, _ = _transcode(["1080p"])
+
+    assert cmd[cmd.index("-master_pl_name") + 1] == "master.m3u8"
+    assert cmd[cmd.index("-f") + 1] == "hls"
+    assert cmd[cmd.index("-hls_playlist_type") + 1] == "vod"
+    assert cmd[cmd.index("-hls_segment_type") + 1] == "mpegts"
 
 
 def test_nothing_is_copied_unless_the_deployment_asks():
@@ -151,6 +223,101 @@ def test_an_hdr_source_is_encoded():
     assert not _copies(cmd)
 
 
+def test_a_rotated_source_is_encoded():
+    # A portrait clip off a phone is H.264 8-bit 4:2:0 SDR at its own size and
+    # passes every other condition. The orientation is a display matrix in the
+    # container, MPEG-TS cannot carry one, and the encode path only gets it
+    # right because a filter graph makes ffmpeg autorotate -- so a copy would
+    # produce a video lying on its side beside an upright thumbnail.
+    for rotation in (90, -90, 180, 270):
+        cmd, _, _ = _transcode(["1080p"], video_stream={
+            **_H264_8BIT,
+            "side_data_list": [
+                {"side_data_type": "Display Matrix", "rotation": rotation},
+            ],
+        })
+        assert not _copies(cmd), f"rotation {rotation} must not be copied"
+
+    # the older spelling of the same thing
+    cmd, _, _ = _transcode(
+        ["1080p"], video_stream={**_H264_8BIT, "tags": {"rotate": "90"}},
+    )
+    assert not _copies(cmd)
+
+
+def test_an_upright_source_is_not_mistaken_for_a_rotated_one():
+    # Side data is where rotation lives, but it is not only rotation that lives
+    # there, and a zero rotation is not a rotation.
+    cmd, _, _ = _transcode(["1080p"], video_stream={
+        **_H264_8BIT,
+        "side_data_list": [
+            {"side_data_type": "Display Matrix", "rotation": 0},
+        ],
+    })
+    assert _copies(cmd)
+
+    cmd, _, _ = _transcode(["1080p"], video_stream={
+        **_H264_8BIT,
+        "side_data_list": [{"side_data_type": "Content Light Level"}],
+    })
+    assert _copies(cmd)
+
+
+def test_an_open_gop_source_is_encoded():
+    # Its later sync samples are recovery points rather than IDRs, so a segment
+    # beginning at one carries no parameter sets and no clean decode point.
+    # Nothing about this fails loudly: playback from the top works and the job
+    # succeeds. Seeking is what breaks, and seeking is what a review tool is.
+    cmd, _, _ = _transcode(["1080p"], open_gop=True)
+
+    assert not _copies(cmd)
+
+
+def test_an_open_gop_source_is_encoded_even_when_the_idr_count_looks_healthy():
+    # A frame split into several slices produces one IDR NAL per slice, so a
+    # master with a single real IDR frame can still out-count its sync samples.
+    # The recovery points are what say what this stream is, and they are why
+    # counting IDRs is not the whole answer.
+    cmd, _, _ = _transcode(["1080p"], open_gop=True, idrs=8)
+
+    assert not _copies(cmd)
+
+
+def test_a_sync_sample_that_is_not_an_idr_is_encoded_without_a_recovery_point():
+    # The recovery-point SEI is how an open-GOP encoder announces itself, but it
+    # is a courtesy rather than a requirement. Counting IDRs against sync
+    # samples is what actually answers the question, so it is checked even when
+    # nothing announced anything.
+    cmd, _, _ = _transcode(["1080p"], keyframes=[0.0, 2.0, 4.0], idrs=1)
+
+    assert not _copies(cmd)
+
+
+def test_a_source_whose_keyframes_are_too_far_apart_is_encoded():
+    # `-hls_time` is a floor for a copy, so the master's own spacing decides
+    # segment length. 20s apart would mean 20s segments.
+    cmd, _, _ = _transcode(["1080p"], keyframes=[0.0, 20.0])
+
+    assert not _copies(cmd)
+
+
+def test_a_source_with_one_sync_sample_in_the_window_is_encoded():
+    # One keyframe in the probe window means the second is somewhere past it,
+    # which is both an unbounded segment and a keyframe structure we did not
+    # get to look at. Refused rather than guessed at.
+    cmd, _, _ = _transcode(["1080p"], keyframes=[0.0])
+
+    assert not _copies(cmd)
+
+
+def test_a_probe_that_says_nothing_useful_is_encoded():
+    # Every refusal costs encode time; the other direction costs an asset
+    # nobody can seek in. So an empty or unreadable probe encodes.
+    cmd, _, _ = _transcode(["1080p"], keyframes=[])
+
+    assert not _copies(cmd)
+
+
 def test_a_source_of_unknown_size_is_encoded():
     # Without dimensions there is nothing to compare the rung against, so the
     # "one rendition at source size" precondition cannot be established.
@@ -192,4 +359,25 @@ def test_a_copied_source_writes_no_second_file_to_download():
     # ... while an encoded ladder still gets one, or this test would pass on a
     # transcoder that had stopped building them at all.
     _, result, commands = _transcode(["1080p"], source=(1920, 1080), source_copy=None)
+    assert result.mp4_key == "hls/media-1/v1/download.mp4"
+
+
+# ─────────────────────────────────── when the remux itself fails
+
+def test_a_failed_remux_is_encoded_rather_than_failed():
+    # A copy has no hardware to degrade from, but it can fail on things
+    # specific to remuxing that an encode absorbs. The setting exists to make a
+    # transcode cheaper, not to add a way for one to fail.
+    cmd, result, commands = _transcode(
+        ["1080p"], remux_fails=True, hls_commands=2,
+    )
+
+    assert _copies(cmd), "the copy is still what is tried first"
+    encoded = [c for c in commands
+               if "-f" in c and c[c.index("-f") + 1] == "hls" and not _copies(c)]
+    assert len(encoded) == 1 and "-filter_complex" in encoded[0]
+    assert result.success
+
+    # and the ladder it fell back to is an ordinary one, so it wants the
+    # download rung like any other
     assert result.mp4_key == "hls/media-1/v1/download.mp4"
