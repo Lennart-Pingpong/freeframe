@@ -121,6 +121,18 @@ describe('renaming from the uploads panel', () => {
     await waitFor(() => expect(api.patch).toHaveBeenCalledTimes(1))
   })
 
+  it('shows why a correction the store sent on its own was refused', async () => {
+    // The other producer of that line. A rename made before initiate answered
+    // is re-sent by the store once the asset exists, with no field open and no
+    // click to report back to, so the row carries `renameError` instead. The
+    // store half of this is pinned; without this the render half was not, and
+    // deleting `?? upload.renameError` left the whole suite green.
+    open(row({ assetName: 'A047C012', renameError: 'Name already taken' }))
+
+    expect(screen.getByText('Name already taken')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'A047C012' })).toBeTruthy()
+  })
+
   it('shows why a refused rename snapped back', async () => {
     vi.mocked(api.patch).mockRejectedValue(new Error('Asset not found'))
     open(row())
