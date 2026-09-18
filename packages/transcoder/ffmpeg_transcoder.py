@@ -291,6 +291,157 @@ def parse_qualities(raw: str | None) -> list[str]:
     return [q for q in QUALITY_MAP if q in known]
 
 
+# ----------------------------------------------------------------- CPU budget
+#
+# How much of the machine one transcode may take (TRANSCODER_CPU_LIMIT).
+#
+# Unset keeps what this has always done: ffmpeg chooses its own thread counts,
+# which on a 16-core host works out at about 10.6 cores for the default ladder.
+# Trimming the ladder is not a way to get the machine back -- a single rung
+# still takes 9.5 -- so an instance that wants to stay responsive while a
+# transcode runs has nothing to reach for. A review instance is not a render
+# farm: nobody is waiting on the encode with a stopwatch, and finishing later on
+# a machine that stays usable is usually the better trade.
+#
+# Measured on a 16-vCPU host, 20 s of 1080p30, libx264 preset fast:
+#
+#   3 rungs, unbounded           6.3 s wall   66.9 s CPU   10.6 cores
+#   3 rungs, 2 threads each     13.6 s wall   66.5 s CPU    4.9 cores
+#   3 rungs, 1 thread each      29.2 s wall   61.6 s CPU    2.1 cores
+#
+# The middle column is why this is safe to offer: total CPU time barely moves.
+# A budget buys wall-clock time, it does not waste work.
+#
+# It has to be a per-output-stream option. A global `-threads` before `-i` is an
+# input option and reaches the decoder; the encoders never see it, and occupancy
+# stays at ~11 cores for every value from 1 to 8.
+
+_CPU_LIMIT_ENV = "TRANSCODER_CPU_LIMIT"
+
+
+def available_cpus() -> int:
+    """Cores this process may actually use, cgroup quota included.
+
+    `os.cpu_count()` reports the host's cores even inside a container with a
+    `cpus:` limit, so a deployment that already caps the worker at 4 of 16 and
+    then asks for 50% would get 8 -- twice what it has. The quota is read first
+    for that reason, affinity second, and the host count only as a last resort.
+    """
+    for quota_path, period_path in (
+        ("/sys/fs/cgroup/cpu.max", None),                                  # cgroup v2
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+         "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),                          # cgroup v1
+    ):
+        try:
+            raw = Path(quota_path).read_text().strip()
+            if period_path is None:
+                quota_s, period_s = raw.split()
+            else:
+                quota_s, period_s = raw, Path(period_path).read_text().strip()
+            if quota_s not in ("max", "-1"):
+                cores = int(quota_s) / int(period_s)
+                # A sub-core quota still gets one thread; zero is not a choice.
+                return int(cores) if cores >= 1 else 1
+        except (OSError, ValueError):
+            pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def parse_cpu_budget(raw: str | None, cpu_count: int | None = None) -> Optional[int]:
+    """Turn TRANSCODER_CPU_LIMIT into a core count, or None for unbounded.
+
+    Accepts an absolute number of cores ("6") or a share of what is available
+    ("50%"). Both shapes are here because operators think in both: someone who
+    knows the box says six, someone on a VPS says half. The share also survives
+    moving the instance to a different machine, where an absolute number quietly
+    means something else.
+
+    An unusable value falls back to unbounded and says so, the way an
+    unrecognised TRANSCODER_OUTPUT resolves to its default rather than refusing
+    to start. Silence would be the worst outcome here: the setting gets written
+    precisely when the machine is already struggling, and an operator who
+    mistyped it would watch the same problem continue with no hint why.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    total = cpu_count if cpu_count is not None else available_cpus()
+
+    if text.endswith("%"):
+        try:
+            share = float(text[:-1].strip().replace(",", "."))
+        except ValueError:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is not a percentage; "
+                  "leaving CPU use unbounded", flush=True)
+            return None
+        if share <= 0:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} would leave no cores; "
+                  "leaving CPU use unbounded", flush=True)
+            return None
+        # Rounded, not truncated: on a 2-core box "50%" has to mean 1, and
+        # truncation would make every share below one core mean "no limit".
+        cores = max(1, round(total * share / 100))
+    else:
+        try:
+            cores = int(text)
+        except ValueError:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is neither a core count "
+                  "nor a percentage; leaving CPU use unbounded", flush=True)
+            return None
+        if cores < 1:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} would leave no cores; "
+                  "leaving CPU use unbounded", flush=True)
+            return None
+
+    if cores >= total:
+        # Asking for everything is the same as asking for nothing, and saying so
+        # is kinder than letting someone believe a limit is in force.
+        print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is {cores} of {total} available "
+              "core(s); leaving CPU use unbounded", flush=True)
+        return None
+    return cores
+
+
+def get_cpu_budget() -> Optional[int]:
+    return parse_cpu_budget(os.environ.get(_CPU_LIMIT_ENV))
+
+
+def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[int], int]]:
+    """Split a core budget into per-encoder threads plus filter-graph threads.
+
+    Returns None when there is no budget, so the command is built exactly as it
+    was before this setting existed.
+
+    The whole budget goes to the encoders and the filter graph gets one thread.
+    That split is measured rather than assumed: with the encoders held at two
+    threads each, capping the graph at one thread cost nothing at all (13.7 s
+    against 13.5 s unbounded; 4.7 cores against 4.8). Scaling is not where the
+    time goes, and leaving the graph unbounded would put back the one pool this
+    setting exists to bound.
+
+    Every rung keeps at least one thread, so `n` rungs cannot go below `n`
+    encoder threads. A budget under the rung count is honoured as closely as it
+    can be, and the shortfall is reported rather than quietly rounded away.
+    """
+    if budget is None or rung_count < 1:
+        return None
+
+    base, remainder = divmod(budget, rung_count)
+    # The remainder goes to the earliest rungs, which are the largest ones and
+    # the slowest to encode.
+    per_rung = [max(1, base + (1 if i < remainder else 0)) for i in range(rung_count)]
+
+    if sum(per_rung) > budget:
+        print(f"[transcoder] {_CPU_LIMIT_ENV} asks for {budget} core(s) but "
+              f"{rung_count} rungs need one thread each; using {sum(per_rung)}",
+              flush=True)
+    return per_rung, 1
+
+
 # Output codec / quality selection (TRANSCODER_OUTPUT).
 #   h264_8  -> H.264 8-bit, DEFAULT (broad device compatibility, smaller files)
 #   h265_10 -> HEVC 10-bit, high quality (opt-in via the env var below)
@@ -1019,6 +1170,15 @@ class FFmpegTranscoder(BaseTranscoder):
 
             primary_backend = "copy" if copy_source else get_backend()
 
+            # Computed once rather than inside _build_ffmpeg_cmd, which runs a
+            # second time when a hardware attempt falls back to software: the
+            # plan does not depend on the backend, and reporting a shortfall
+            # twice for one job would read like two jobs. Computing it for a
+            # job that goes on to stream-copy is harmless -- a copy only happens
+            # when the ladder has resolved to a single rung, and a single rung
+            # is never short of threads.
+            cpu_plan = thread_plan(get_cpu_budget(), len(qualities))
+
             hls_dir = work_dir / "hls"
             hls_dir.mkdir()
 
@@ -1146,6 +1306,8 @@ class FFmpegTranscoder(BaseTranscoder):
                     ffmpeg_cmd += _BACKEND_HWACCEL.get(backend, [])
                 ffmpeg_cmd += ["-i", input_url]
                 ffmpeg_cmd += ["-filter_complex", filter_complex]
+                if cpu_plan is not None:
+                    ffmpeg_cmd += ["-filter_complex_threads", str(cpu_plan[1])]
 
                 # Per-backend encoder selection driven by TRANSCODER_OUTPUT.
                 family = out_mode["family"]      # "hevc" or "h264"
@@ -1163,6 +1325,15 @@ class FFmpegTranscoder(BaseTranscoder):
                             ffmpeg_cmd += ["-pix_fmt", "yuv420p10le", "-crf", str(crf - 4)]
                         else:
                             ffmpeg_cmd += ["-pix_fmt", "yuv420p", "-crf", str(crf + 4)]
+                        if cpu_plan is not None:
+                            # Software encoders only. The hardware ones do their
+                            # work on the device and take their thread counts
+                            # from the driver, so a count here would either be
+                            # ignored or throttle the one part that is not the
+                            # bottleneck. What a hardware backend still spends on
+                            # the CPU is decode and the filter graph, and
+                            # -filter_complex_threads above already covers that.
+                            ffmpeg_cmd += [f"-threads:v:{i}", str(cpu_plan[0][i])]
                     elif backend == "nvenc":
                         enc = "hevc_nvenc" if family == "hevc" else "h264_nvenc"
                         cq = _NVENC_CQ.get(get_output_mode(), 26)
