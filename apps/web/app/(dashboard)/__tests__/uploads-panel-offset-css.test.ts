@@ -53,6 +53,12 @@ beforeAll(async () => {
 function mediaContexts(offset: string): (string | null)[] {
   const found: (string | null)[] = []
   postcss.parse(css).walkDecls('--ff-left', (decl) => {
+    // postcss keeps `!important` as a flag rather than in the value, so an
+    // `![--ff-left:52px]` base compiles to an unconditional rule the `md:` one
+    // can never win against: the panel would sit at 52px over an expanded rail
+    // at every width with all five of these green. A declaration that cannot
+    // be overridden is not the offset this file is asserting.
+    if (decl.important) return
     if (decl.value.trim() !== offset) return
     const rule = decl.parent
     const parent = rule?.parent
