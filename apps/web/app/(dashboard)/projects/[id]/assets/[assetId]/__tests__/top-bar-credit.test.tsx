@@ -173,7 +173,11 @@ describe('the credit and the asset navigator in the top bar', () => {
 
     const credit = screen.getByTitle('FreeFrame on GitHub')
 
-    expect(credit.className).toContain('hidden')
-    expect(credit.className).toContain('lg:inline-flex')
+    // Whole class, not a substring: `overflow-hidden` satisfies a substring
+    // match, and `overflow-hidden lg:inline-flex` leaves twMerge the base
+    // `inline-flex` to keep, which restores the overlap at every width with
+    // this test still green.
+    expect(credit.className.split(/\s+/)).toContain('hidden')
+    expect(credit.className.split(/\s+/)).toContain('lg:inline-flex')
   })
 })
