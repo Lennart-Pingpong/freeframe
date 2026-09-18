@@ -1,5 +1,6 @@
 import { create, type StateCreator } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { mutate as globalMutate } from 'swr'
 import { api } from '@/lib/api'
 import type { AssetResponse } from '@/types'
 
@@ -335,6 +336,21 @@ export interface UploadFile {
   versionId?: string
   uploadId?: string
   createdAt: number // timestamp for grouping
+  /**
+   * True for a row rebuilt from `/me/assets` rather than started here.
+   *
+   * That endpoint spans every project the user can see, in whatever role they
+   * hold there, so a history row is not proof of the `editor` role that
+   * renaming needs -- a reviewer's own history is full of assets they cannot
+   * touch. A row this session started is proof, because starting it required
+   * the same role.
+   */
+  fromHistory?: boolean
+  /** Why a rename that happened without the user watching was refused. The
+   *  interactive path reports upwards through `renameUpload`'s return value;
+   *  the correction sent during `/upload/initiate`'s round trip has nobody to
+   *  return to, so it leaves the reason here. */
+  renameError?: string
 }
 
 interface InitiateResponse {
@@ -366,6 +382,9 @@ interface UploadStore {
   startUpload: (file: File, projectId: string, assetName: string, projectName?: string, folderId?: string | null) => string
   startVersionUpload: (file: File, assetId: string, assetName: string, projectId: string) => string
   cancelUpload: (fileId: string) => void
+  /** Rename the asset a row is uploading. Resolves to an error message, or
+   *  null when the new name is stored. */
+  renameUpload: (fileId: string, name: string) => Promise<string | null>
   removeFile: (fileId: string) => void
   clearCompleted: () => void
   fetchHistory: () => Promise<void>
@@ -442,6 +461,7 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
         assetId: a.id,
         versionId: v.id,
         createdAt: new Date(v.created_at).getTime(),
+        fromHistory: true,
       }
     })
   return [...existing, ...newFiles]
@@ -500,11 +520,16 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       try {
         updateFile(id, { status: 'uploading' })
 
+        // What the asset will be called. This body runs synchronously until the
+        // first await, so initiate is dispatched in the same tick as the row is
+        // created: there is no instant in between for anyone to rename it.
+        const sentName = assetName
+
         const initRes = await api.post<InitiateResponse>(
           '/upload/initiate',
           {
             project_id: projectId,
-            asset_name: assetName,
+            asset_name: sentName,
             original_filename: file.name,
             file_size_bytes: file.size,
             mime_type: file.type,
@@ -517,6 +542,33 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         asset_id = initRes.asset_id
 
         updateFile(id, { uploadId: upload_id, assetId: asset_id, versionId: version_id })
+
+        // The round trip is the window that does exist, and the only place a
+        // rename can be lost: the panel offers the pencil from the moment the
+        // row appears, so an edit during it went into the row while the request
+        // carrying the old name had already left. Now that the asset exists it
+        // can be told. Failing here must not fail the upload -- the bytes are
+        // the point.
+        //
+        // It must not be swallowed either. The row is put back to the name the
+        // asset actually has and the reason is recorded on it, the way the
+        // interactive rename path does. Keeping the refused name would leave
+        // the row disagreeing with the asset, the grid, search and the share
+        // link for the rest of the session -- and would also block the retry,
+        // since `renameUpload` returns early when the typed name equals the
+        // one already in the row.
+        const nameAfterInitiate =
+          get().files.find((f) => f.id === id)?.assetName ?? sentName
+        if (nameAfterInitiate !== sentName) {
+          try {
+            await api.patch(`/assets/${asset_id}`, { name: nameAfterInitiate })
+          } catch (err) {
+            updateFile(id, {
+              assetName: sentName,
+              renameError: err instanceof Error ? err.message : 'Rename failed',
+            })
+          }
+        }
 
         const parts = await uploadAllParts(file, s3_key, upload_id, controller, (percent) =>
           updateFile(id, { progress: percent }),
@@ -702,6 +754,60 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         f.id === fileId ? { ...f, status: 'cancelled' as const, progress: 0 } : f,
       ),
     }))
+  },
+
+  renameUpload: async (fileId, name) => {
+    const row = get().files.find((f) => f.id === fileId)
+    if (!row) return null
+    const trimmed = name.trim()
+    if (!trimmed || trimmed === row.assetName) return null
+
+    // A history row cannot be renamed: it came from `/me/assets` -- see
+    // `fromHistory` -- so it is not proof of the role the edit needs, and
+    // offering it only to answer 403 is worse than not offering it.
+    if (row.fromHistory) return null
+
+    const previous = row.assetName
+    const applyName = (value: string) =>
+      set((s) => ({
+        files: s.files.map((f) =>
+          // Any rename clears the recorded one: whatever it said is about a
+          // name the row no longer carries.
+          f.id === fileId ? { ...f, assetName: value, renameError: undefined } : f,
+        ),
+      }))
+
+    // Optimistic. The user has just left a text field; putting the old name
+    // back for the length of a round trip reads as the edit having failed.
+    applyName(trimmed)
+
+    // No asset yet, because `/upload/initiate` is what creates one. The row is
+    // the only record of the name until it answers, and it is the record
+    // initiate reads -- so this is stored, just not on the server yet.
+    if (!row.assetId) return null
+
+    try {
+      await api.patch(`/assets/${row.assetId}`, { name: trimmed })
+    } catch (err) {
+      applyName(previous)
+      return err instanceof Error ? err.message : 'Rename failed'
+    }
+
+    // The panel is mounted in the dashboard layout, so it has no handle on the
+    // grid it is floating over and no way to tell it the name changed. Every
+    // asset list is keyed by a path containing `/assets`, so revalidating that
+    // set is what makes the card behind the panel agree with the row in it.
+    //
+    // One argument, deliberately. swr short-circuits to a pure revalidate only
+    // when fewer than three are passed; with three it falls through to
+    // `populateCache`, which defaults to true, and writes `undefined` into
+    // every matching key before refetching. That blanks the grid behind the
+    // panel into skeletons for the length of the refetch, and the review
+    // screen's comment list into "No comments yet", because `use-comments`
+    // does `data ?? []` and the page passes no `isLoading`. Both forms
+    // revalidate; the extra arguments only buy the blank.
+    void globalMutate((key) => typeof key === 'string' && key.includes('/assets'))
+    return null
   },
 
   removeFile: (fileId) => {
