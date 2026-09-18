@@ -562,6 +562,40 @@ describe('polling a row whose upload is running on another device', () => {
     expect(rowOf('row-1').status).toBe('interrupted')
   })
 
+  it('leaves this tab its own dropped upload alone instead of calling it elsewhere', async () => {
+    // The stamp the server hands back for a row this tab owns is this tab's
+    // own trailing part activity, so it says nothing about a second sender.
+    // Reading it as one took the upload away from the user who owned it: the
+    // transfer drops, the version is still `uploading` with a stamp seconds
+    // old, and the first poll inside half a minute turned the row `elsewhere`,
+    // which offers no Resume, no Discard and no Cancel. The row then left
+    // `watched`, so nothing polled it again and nothing corrected it for the
+    // rest of the live window.
+    useUploadStore.setState({
+      files: [
+        row({ status: 'interrupted', ownerTab: currentTabId(), heartbeatAt: Date.now() - 5000 }),
+      ],
+    })
+    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('interrupted')
+    expect(rowOf('row-1').elsewhereUntil).toBeUndefined()
+  })
+
+  it('still hands a row it does not own to the device that is sending it', async () => {
+    // The other half of the same branch, so the fix above cannot be widened
+    // into switching the poll off. A row this tab never owned, with the server
+    // reporting movement, is exactly what `elsewhere` exists to say.
+    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: OTHER_TAB })] })
+    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+
+    await useUploadStore.getState().refreshProcessingItems()
+
+    expect(rowOf('row-1').status).toBe('elsewhere')
+  })
+
   it('keeps the progress it had rather than jumping to 100', async () => {
     useUploadStore.setState({
       files: [row({ status: 'interrupted', ownerTab: undefined, progress: 41 })],

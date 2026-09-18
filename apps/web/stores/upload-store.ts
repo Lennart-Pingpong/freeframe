@@ -1452,7 +1452,19 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           // just been fetched. Judged the way `mergeHistoryAssets` judges it,
           // so history and the poll cannot disagree about the same version.
           const version = asset.latest_version
-          const movingUntil = version.processing_status === 'uploading'
+          // `last_activity_at` says that bytes moved, not who moved them. On a
+          // row this tab owns it is this tab's own trailing part activity
+          // handed back, so it is no evidence of another sender: a transfer
+          // that drops here leaves the version `uploading` with a stamp
+          // seconds old, and reading that as `elsewhere` took the user's own
+          // upload away from them. `elsewhere` offers no Resume, no Discard
+          // and no Cancel, and such a row is not in `watched` below, so
+          // nothing put it back until the stamp aged out a window later.
+          // Judge only the rows this tab is not responsible for. For its own,
+          // the destructive actions are still refused where they are taken,
+          // by `activeElsewhere`, which is where that decision belongs.
+          const ownRow = f.ownerTab === currentTabId()
+          const movingUntil = !ownRow && version.processing_status === 'uploading'
             ? liveUntil(version.last_activity_at)
             : undefined
           const stillMoving = movingUntil !== undefined && Date.now() < movingUntil
