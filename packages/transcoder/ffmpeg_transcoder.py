@@ -416,12 +416,38 @@ def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[i
     Returns None when there is no budget, so the command is built exactly as it
     was before this setting existed.
 
-    The whole budget goes to the encoders and the filter graph gets one thread.
-    That split is measured rather than assumed: with the encoders held at two
-    threads each, capping the graph at one thread cost nothing at all (13.7 s
-    against 13.5 s unbounded; 4.7 cores against 4.8). Scaling is not where the
-    time goes, and leaving the graph unbounded would put back the one pool this
-    setting exists to bound.
+    The encoders get the budget split between them and the filter graph gets
+    half of it. Both numbers are measured, and the graph's share is the one that
+    had to be measured twice.
+
+    It was one thread at first, on the strength of a 1080p SDR source where
+    capping the graph cost nothing (13.7 s against 13.5 s unbounded). That
+    number is real and still reproduces -- and it is a statement about a graph
+    that has almost nothing to do, not about this setting. A 4K source scales
+    three rungs, and an HDR one tone-maps every frame before the split through
+    `zscale, tonemap, zscale`, which are slice-threaded. Pinning the graph at
+    one thread serialises exactly the expensive part.
+
+    Measured on 16 cores, three rungs, budget 6, three runs each, spread 1-4%:
+
+        source                 graph=1          graph=3        graph=6
+        1080p SDR          16.2 s / 4.44    16.2 s / 4.38   16.5 s / 4.39
+        4K, scale only     30.4 s / 2.99    16.2 s / 5.87   10.7 s / 9.02
+        4K HDR, tone-map  101.5 s / 1.65    51.1 s / 3.68   30.5 s / 6.44
+
+    Half the budget is the only share that stays inside the cap everywhere. The
+    whole budget is 1.5x faster again and overruns it on both 4K sources, by
+    0.44 cores on the tone-map graph and by 3.0 on the scaling one. One thread
+    holds the cap only by wasting it: the operator granted six cores and the job
+    takes 1.65. On the 1080p source, where the first measurement was taken, the
+    share makes no measurable difference at all, so nothing is traded away for
+    the sources that do need it.
+
+    The graph's threads are not subtracted from the encoders'. Thread counts are
+    ceilings on parallelism rather than reservations, and the stages run as a
+    pipeline: whichever is slowest holds the others back, so the sum of the
+    ceilings is not what the job occupies. What the job occupies is measured
+    above, and at half the budget it stays under the cap on every source tried.
 
     Every rung keeps at least one thread, so `n` rungs cannot go below `n`
     encoder threads. A budget under the rung count is honoured as closely as it
@@ -439,7 +465,7 @@ def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[i
         print(f"[transcoder] {_CPU_LIMIT_ENV} asks for {budget} core(s) but "
               f"{rung_count} rungs need one thread each; using {sum(per_rung)}",
               flush=True)
-    return per_rung, 1
+    return per_rung, max(1, budget // 2)
 
 
 # Output codec / quality selection (TRANSCODER_OUTPUT).
@@ -1330,9 +1356,13 @@ class FFmpegTranscoder(BaseTranscoder):
                             # work on the device and take their thread counts
                             # from the driver, so a count here would either be
                             # ignored or throttle the one part that is not the
-                            # bottleneck. What a hardware backend still spends on
-                            # the CPU is decode and the filter graph, and
-                            # -filter_complex_threads above already covers that.
+                            # bottleneck. On a hardware backend the CPU work
+                            # that remains is decode and the filter graph;
+                            # -filter_complex_threads above covers the graph,
+                            # and decode is not covered on any backend -- there
+                            # is deliberately no global -threads here, because
+                            # before -i it would reach only the decoder and
+                            # leave every encoder unbounded.
                             ffmpeg_cmd += [f"-threads:v:{i}", str(cpu_plan[0][i])]
                     elif backend == "nvenc":
                         enc = "hevc_nvenc" if family == "hevc" else "h264_nvenc"

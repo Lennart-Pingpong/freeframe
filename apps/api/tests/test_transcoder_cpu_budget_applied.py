@@ -10,6 +10,7 @@ this feature can have, so the placement is pinned, not just the presence.
 """
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -36,8 +37,17 @@ def _a_machine_of_a_known_size(monkeypatch):
     )
 
 
-def _ffmpeg_cmd_for(qualities: list[str], source=(1920, 1080)) -> list[str]:
-    """Run a transcode with everything mocked and return the ffmpeg command."""
+def _ffmpeg_cmd_for(qualities: list[str], source=(1920, 1080),
+                    color_transfer: str | None = None,
+                    backend: str | None = None) -> list[str]:
+    """Run a transcode with everything mocked and return the ffmpeg command.
+
+    `color_transfer="arib-std-b67"` makes the source HDR, which is what puts the
+    tone-map chain into the filter graph -- the expensive part of the graph, and
+    the one an ordinary phone clip goes through. `backend="nvenc"` forces a
+    hardware attempt: the mocked `subprocess.run` reports success, so the first
+    attempt is the only command built and there is no fallback to read past.
+    """
     width, height = source
 
     def run(cmd, **_kwargs):
@@ -45,9 +55,11 @@ def _ffmpeg_cmd_for(qualities: list[str], source=(1920, 1080)) -> list[str]:
         mock.returncode = 0
         mock.stderr = ""
         if "-select_streams" in cmd and cmd[cmd.index("-select_streams") + 1] == "v:0":
-            mock.stdout = json.dumps({"streams": [
-                {"r_frame_rate": "25/1", "duration": 6.0, "width": width, "height": height},
-            ]})
+            stream = {"r_frame_rate": "25/1", "duration": 6.0,
+                      "width": width, "height": height}
+            if color_transfer:
+                stream["color_transfer"] = color_transfer
+            mock.stdout = json.dumps({"streams": [stream]})
         elif "-select_streams" in cmd and cmd[cmd.index("-select_streams") + 1] == "a":
             mock.stdout = json.dumps({"streams": []})
         return mock
@@ -59,12 +71,18 @@ def _ffmpeg_cmd_for(qualities: list[str], source=(1920, 1080)) -> list[str]:
     )
     s3 = MagicMock()
     s3.generate_presigned_url.return_value = "https://s3.example.com/uploads/video.mp4"
+    backend_patch = (
+        patch("packages.transcoder.ffmpeg_transcoder.get_backend",
+              return_value=backend)
+        if backend else nullcontext()
+    )
     with patch("subprocess.run", side_effect=run) as mock_run, \
          patch("builtins.open", MagicMock()), \
          patch("pathlib.Path.glob", return_value=[]), \
          patch("pathlib.Path.rglob", return_value=[]), \
          patch("pathlib.Path.mkdir"), \
-         patch("shutil.rmtree"):
+         patch("shutil.rmtree"), \
+         backend_patch:
         asyncio.run(FFmpegTranscoder(s3, "test-bucket").transcode(job))
     calls = [c for c in mock_run.call_args_list
              if any("filter_complex" in str(a) for a in c[0][0])]
@@ -151,14 +169,76 @@ def test_every_rung_keeps_a_thread_when_the_budget_is_smaller(monkeypatch):
 # --------------------------------------------------------- the filter graph
 
 def test_the_filter_graph_is_bounded_too(monkeypatch):
-    # Measured: with the encoders at two threads each, capping the graph at one
-    # cost nothing (13.7s against 13.5s unbounded, 4.7 cores against 4.8).
-    # Leaving it out would put back the one unbounded pool this setting exists
-    # to remove.
+    # Leaving the graph out would put back the one unbounded pool this setting
+    # exists to remove: unset, it went to 9-11 cores on a 4K source.
     monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "6")
     cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"])
 
+    assert "-filter_complex_threads" in cmd
+
+
+def test_the_filter_graph_gets_half_the_budget(monkeypatch):
+    # Not one thread, which is what this was until a 4K source was measured
+    # rather than a 1080p one. At one thread the graph becomes the bottleneck
+    # and the job takes 1.65 of the six cores it was granted; at half the budget
+    # it takes 3.68 and finishes in half the time. The whole budget is faster
+    # again and overruns the cap on every 4K source tried, so half is the share
+    # that is both useful and honest.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "6")
+    cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"])
+
+    assert cmd[cmd.index("-filter_complex_threads") + 1] == "3"
+
+
+def test_a_budget_of_one_still_leaves_the_graph_a_thread(monkeypatch):
+    # budget // 2 is 0 here, and a filter graph with zero threads is not a
+    # slower graph, it is a command ffmpeg rejects.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "1")
+    cmd = _ffmpeg_cmd_for(["720p"])
+
     assert cmd[cmd.index("-filter_complex_threads") + 1] == "1"
+
+
+# ------------------------------------------------------- the hardware backends
+
+def test_a_hardware_backend_still_bounds_the_filter_graph(monkeypatch):
+    # The gap this closes: -threads:v:i is emitted only for software encoders,
+    # so before the graph scaled with the budget, TRANSCODER_CPU_LIMIT=2 and
+    # =14 built byte-identical commands on nvenc and the operator's number was
+    # discarded. On a hardware backend the filter graph is the CPU work there
+    # is -- an HDR source tone-maps through hwdownload, zscale, tonemap,
+    # hwupload -- so it is the one thing worth capping.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "8")
+    cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"],
+                          color_transfer="arib-std-b67", backend="nvenc")
+
+    assert cmd[cmd.index("-filter_complex_threads") + 1] == "4"
+
+
+def test_a_hardware_backend_gets_no_encoder_thread_counts(monkeypatch):
+    # The hardware encoders take their thread counts from the driver. A count
+    # here would either be ignored or throttle the part that is not the
+    # bottleneck, so the budget must not reach them.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "8")
+    cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"],
+                          color_transfer="arib-std-b67", backend="nvenc")
+
+    assert _threads_for(cmd) == {}
+    assert "-threads" not in cmd
+
+
+def test_the_budget_reaches_a_hardware_command_at_all(monkeypatch):
+    # The regression that started this: two different budgets producing the
+    # same command. Nothing pinned it, and both a fix and its absence stayed
+    # green.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "2")
+    klein = _ffmpeg_cmd_for(["1080p", "720p", "360p"],
+                            color_transfer="arib-std-b67", backend="nvenc")
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "14")
+    gross = _ffmpeg_cmd_for(["1080p", "720p", "360p"],
+                            color_transfer="arib-std-b67", backend="nvenc")
+
+    assert klein != gross, "the operator's number changes nothing on nvenc"
 
 
 # ------------------------------------------------------- the stream-copy path

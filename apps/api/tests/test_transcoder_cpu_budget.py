@@ -132,7 +132,7 @@ def test_a_budget_is_split_across_the_rungs():
     per_rung, filter_threads = thread_plan(6, 3)
     assert per_rung == [2, 2, 2]
     assert sum(per_rung) == 6
-    assert filter_threads == 1
+    assert filter_threads == 3
 
 
 def test_a_remainder_goes_to_the_largest_rungs():
@@ -148,12 +148,20 @@ def test_a_single_rung_gets_the_whole_budget():
     assert per_rung == [6]
 
 
-def test_the_filter_graph_gets_one_thread_whatever_the_budget():
-    # Measured, not assumed: holding the encoders at two threads each, capping
-    # the graph at one cost nothing (13.7s against 13.5s unbounded). Leaving it
-    # unbounded would put back the one pool this setting exists to bound.
-    for budget in (1, 2, 6, 12):
-        assert thread_plan(budget, 3)[1] == 1
+def test_the_filter_graph_gets_half_the_budget():
+    # This said "one thread whatever the budget" until the measurement behind it
+    # was repeated on something other than a 1080p SDR source. One thread makes
+    # the graph the bottleneck on anything that has real scaling or tone-mapping
+    # to do: on a 4K HDR source a budget of six cores occupied 1.65 of them and
+    # took 101.5s, against 3.68 and 51.1s at half the budget. The whole budget
+    # is faster again (30.5s) and overruns the cap on every 4K source tried, so
+    # half is the share that both uses the grant and keeps the promise.
+    assert thread_plan(6, 3)[1] == 3
+    assert thread_plan(12, 3)[1] == 6
+    # Never zero: budget // 2 is 0 below two cores, and a graph with no threads
+    # is a command ffmpeg rejects, not a slower graph.
+    assert thread_plan(1, 3)[1] == 1
+    assert thread_plan(2, 3)[1] == 1
 
 
 def test_a_budget_below_the_rung_count_keeps_every_rung_alive(capsys):
@@ -215,7 +223,12 @@ def test_an_unlimited_cgroup_falls_through_to_the_real_core_count(monkeypatch):
         raise OSError("not here")
 
     monkeypatch.setattr(mod.Path, "read_text", fake_read_text)
-    monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(12)))
+    # raising=False because sched_getaffinity is Linux-only: on macOS the
+    # attribute does not exist and monkeypatch would fail the test before it
+    # ran. The production guard for that same absence is a real one and is
+    # covered by its own test below.
+    monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(12)),
+                        raising=False)
     assert mod.available_cpus() == 12
 
 
@@ -231,3 +244,57 @@ def test_a_sub_core_quota_still_yields_one(monkeypatch):
 
     monkeypatch.setattr(mod.Path, "read_text", fake_read_text)
     assert mod.available_cpus() == 1
+
+
+# --- cgroup v1 ----------------------------------------------------------
+# The v1 pair is read for hosts that have not moved to v2, and until these
+# three tests existed nothing covered it in either direction: deleting the v1
+# tuple entirely left the suite green.
+
+_V1_QUOTA = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+_V1_PERIOD = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+
+
+def _only_v1(quota: str, period: str = "100000\n"):
+    """A host with no cgroup v2 file and the given v1 pair."""
+    def fake_read_text(self, *args, **kwargs):
+        if str(self) == _V1_QUOTA:
+            return quota
+        if str(self) == _V1_PERIOD:
+            return period
+        raise OSError("not here")
+    return fake_read_text
+
+
+def test_a_cgroup_v1_quota_is_read(monkeypatch):
+    # 400000/100000 is `cpus: 4` as cgroup v1 writes it.
+    import packages.transcoder.ffmpeg_transcoder as mod
+
+    monkeypatch.setattr(mod.Path, "read_text", _only_v1("400000\n"))
+    assert mod.available_cpus() == 4
+
+
+def test_an_unrestricted_cgroup_v1_host_falls_through(monkeypatch):
+    # v1 writes -1, not "max", for no limit. Read as a number it is a quota of
+    # -1/100000, which clamps to one core -- and then every budget on the box
+    # resolves to unbounded, because a budget >= the core count deliberately
+    # does. A whole deployment's setting would go silently dead, with one log
+    # line to show for it.
+    import packages.transcoder.ffmpeg_transcoder as mod
+
+    monkeypatch.setattr(mod.Path, "read_text", _only_v1("-1\n"))
+    monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(8)),
+                        raising=False)
+    assert mod.available_cpus() == 8
+
+
+def test_an_unreadable_quota_falls_through_rather_than_raising(monkeypatch):
+    # A quota file that is empty or not a number must not take the worker down
+    # on a host nobody anticipated. ValueError belongs in the except clause for
+    # this, and narrowing it to OSError alone would let this one through.
+    import packages.transcoder.ffmpeg_transcoder as mod
+
+    monkeypatch.setattr(mod.Path, "read_text", _only_v1("\n"))
+    monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(3)),
+                        raising=False)
+    assert mod.available_cpus() == 3
