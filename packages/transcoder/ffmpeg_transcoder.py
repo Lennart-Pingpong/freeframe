@@ -435,7 +435,7 @@ def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[i
         4K, scale only     30.4 s / 2.99    16.2 s / 5.87   10.7 s / 9.02
         4K HDR, tone-map  101.5 s / 1.65    51.1 s / 3.68   30.5 s / 6.44
 
-    Half the budget is the only share that stays inside the cap everywhere. The
+    Half the budget is the largest share that stays inside the cap on all three. The
     whole budget is 1.5x faster again and overruns it on both 4K sources, by
     0.44 cores on the tone-map graph and by 3.0 on the scaling one. One thread
     holds the cap only by wasting it: the operator granted six cores and the job

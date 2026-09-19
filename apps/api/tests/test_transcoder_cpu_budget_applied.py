@@ -231,6 +231,13 @@ def test_the_budget_reaches_a_hardware_command_at_all(monkeypatch):
     # The regression that started this: two different budgets producing the
     # same command. Nothing pinned it, and both a fix and its absence stayed
     # green.
+    #
+    # Compare the one token the budget can reach, not the two whole commands.
+    # Each _ffmpeg_cmd_for call makes its own tempfile.mkdtemp work dir, and
+    # that path lands in -hls_segment_filename and the playlist argument, so
+    # `klein != gross` is true for any two invocations whatever the budget
+    # does: it stayed green with `return per_rung, 1` restored and with the
+    # -filter_complex_threads emission deleted outright.
     monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "2")
     klein = _ffmpeg_cmd_for(["1080p", "720p", "360p"],
                             color_transfer="arib-std-b67", backend="nvenc")
@@ -238,7 +245,10 @@ def test_the_budget_reaches_a_hardware_command_at_all(monkeypatch):
     gross = _ffmpeg_cmd_for(["1080p", "720p", "360p"],
                             color_transfer="arib-std-b67", backend="nvenc")
 
-    assert klein != gross, "the operator's number changes nothing on nvenc"
+    assert "-filter_complex_threads" in klein, "the budget reaches no option at all"
+    assert (klein[klein.index("-filter_complex_threads") + 1]
+            != gross[gross.index("-filter_complex_threads") + 1]), \
+        "the operator's number changes nothing on nvenc"
 
 
 # ------------------------------------------------------- the stream-copy path

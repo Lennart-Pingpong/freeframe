@@ -268,9 +268,16 @@ def _only_v1(quota: str, period: str = "100000\n"):
 
 def test_a_cgroup_v1_quota_is_read(monkeypatch):
     # 400000/100000 is `cpus: 4` as cgroup v1 writes it.
+    #
+    # The affinity patch is what makes this a test. Without it the assertion is
+    # satisfied by the fall-through on any host that reports four available
+    # CPUs, which `ubuntu-latest` does, so deleting the v1 tuple would stay
+    # green in CI while reddening here and on a 16-core box.
     import packages.transcoder.ffmpeg_transcoder as mod
 
     monkeypatch.setattr(mod.Path, "read_text", _only_v1("400000\n"))
+    monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(9)),
+                        raising=False)
     assert mod.available_cpus() == 4
 
 
