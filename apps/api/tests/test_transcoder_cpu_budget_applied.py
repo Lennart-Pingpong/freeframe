@@ -157,7 +157,8 @@ def test_a_share_is_resolved_against_what_is_available(monkeypatch):
 
 
 def test_every_rung_keeps_a_thread_when_the_budget_is_smaller(monkeypatch):
-    # A rung with zero threads is not a slower rung, it is a broken command.
+    # A rung with zero threads is not a slower rung, it is an unbounded one:
+    # ffmpeg reads a zero thread count as "pick for yourself".
     monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "2")
     cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"])
 
@@ -192,7 +193,9 @@ def test_the_filter_graph_gets_half_the_budget(monkeypatch):
 
 def test_a_budget_of_one_still_leaves_the_graph_a_thread(monkeypatch):
     # budget // 2 is 0 here, and a filter graph with zero threads is not a
-    # slower graph, it is a command ffmpeg rejects.
+    # slower graph, it is the unbounded graph: ffmpeg accepts
+    # `-filter_complex_threads 0` and reads it as "pick for yourself". So the
+    # smallest budget an operator can set is the one that would cap least.
     monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "1")
     cmd = _ffmpeg_cmd_for(["720p"])
 

@@ -315,6 +315,15 @@ def parse_qualities(raw: str | None) -> list[str]:
 # It has to be a per-output-stream option. A global `-threads` before `-i` is an
 # input option and reaches the decoder; the encoders never see it, and occupancy
 # stays at ~11 cores for every value from 1 to 8.
+#
+# Every thread count below has a `max(1, ...)` floor, and the reason is not that
+# ffmpeg refuses a zero. It accepts one everywhere: `-threads 0`, `-threads:v:0
+# 0` and `-filter_complex_threads 0` all run to completion, because zero is how
+# ffmpeg spells "pick for yourself". Measured on the same host, one 1080p
+# encode: `-threads:v:0 0` occupies 7.97 cores, `1` occupies 1.17, `2` occupies
+# 2.50. A zero anywhere in the plan therefore does not break the command, it
+# silently switches the cap off for that stage -- which is the outcome this
+# setting exists to prevent, and the one an operator would never spot.
 
 _CPU_LIMIT_ENV = "TRANSCODER_CPU_LIMIT"
 
@@ -340,7 +349,8 @@ def available_cpus() -> int:
                 quota_s, period_s = raw, Path(period_path).read_text().strip()
             if quota_s not in ("max", "-1"):
                 cores = int(quota_s) / int(period_s)
-                # A sub-core quota still gets one thread; zero is not a choice.
+                # A sub-core quota still gets one thread. Zero would not be a
+                # smaller budget, it would be no budget -- see the note above.
                 return int(cores) if cores >= 1 else 1
         except (OSError, ValueError):
             pass
@@ -446,8 +456,32 @@ def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[i
     The graph's threads are not subtracted from the encoders'. Thread counts are
     ceilings on parallelism rather than reservations, and the stages run as a
     pipeline: whichever is slowest holds the others back, so the sum of the
-    ceilings is not what the job occupies. What the job occupies is measured
-    above, and at half the budget it stays under the cap on every source tried.
+    ceilings is not what the job occupies. On the three sources above, at half
+    the budget, what it occupied stayed inside the cap.
+
+    That is a measurement and not a promise, because one stage is inside no
+    budget: decoding. A capped job can exceed its cap, and the amount is the
+    decoder's CPU time divided by how long the rest of the job runs -- an
+    uncapped decoder runs only as fast as the capped stages take frames from it,
+    so the same decode is a fraction of a core over a long job and several cores
+    over a short one. Measured on 16 cores at a budget of 6, the same 12.5s of
+    1080p, three runs each:
+
+        master                decode alone     3 rungs      1 rung
+        H.264                  5.8 CPU-s     4.45 cores   5.92 cores
+        ProRes 4444 XQ        24.0 CPU-s     5.47 cores   7.70 cores
+
+    Only the last cell is over, and it is over by 28%. The sources above are all
+    H.264 and all three-rung, which is why they all held. A shorter ladder and a
+    faster machine both shrink the divisor, so `TRANSCODER_QUALITIES` trimmed to
+    one rung is the configuration where this leaks most -- and an upstream report
+    on an 11-core host measured 7.46 cores for a ProRes master at three rungs,
+    where this host measured 5.47.
+
+    Capping the decoder is not the fix. `-threads` before `-i` does reach it, and
+    on the full job it moved occupancy by less than the run-to-run spread, here
+    and on the reporting host, because the decoder is not what the pipeline is
+    waiting on.
 
     Every rung keeps at least one thread, so `n` rungs cannot go below `n`
     encoder threads. A budget under the rung count is honoured as closely as it

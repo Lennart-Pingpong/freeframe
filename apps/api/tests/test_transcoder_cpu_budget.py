@@ -62,8 +62,9 @@ def test_a_percentage_is_rounded_not_truncated():
 
 def test_a_percentage_never_rounds_down_to_nothing():
     # Separate from the rounding above, and separately mutable: on a small box
-    # a share under half a core would otherwise resolve to zero threads, which
-    # is not a quieter encode but a command ffmpeg rejects.
+    # a share under half a core would otherwise resolve to zero, which ffmpeg
+    # reads as "pick for yourself" -- so the quietest setting available would
+    # be the one that caps nothing at all.
     assert parse_cpu_budget("1%", cpu_count=8) == 1
     assert parse_cpu_budget("10%", cpu_count=4) == 1      # 0.4
 
@@ -154,20 +155,23 @@ def test_the_filter_graph_gets_half_the_budget():
     # the graph the bottleneck on anything that has real scaling or tone-mapping
     # to do: on a 4K HDR source a budget of six cores occupied 1.65 of them and
     # took 101.5s, against 3.68 and 51.1s at half the budget. The whole budget
-    # is faster again (30.5s) and overruns the cap on every 4K source tried, so
-    # half is the share that both uses the grant and keeps the promise.
+    # is faster again (30.5s) and overruns the cap on both 4K sources, so half
+    # is the largest share that stayed inside it on all three.
     assert thread_plan(6, 3)[1] == 3
     assert thread_plan(12, 3)[1] == 6
-    # Never zero: budget // 2 is 0 below two cores, and a graph with no threads
-    # is a command ffmpeg rejects, not a slower graph.
+    # Never zero: budget // 2 is 0 below two cores, and `-filter_complex_threads
+    # 0` is not a slower graph, it is the unbounded graph. ffmpeg accepts it and
+    # reads zero as "pick for yourself", so the floor is what keeps the smallest
+    # budget from being the one that caps nothing.
     assert thread_plan(1, 3)[1] == 1
     assert thread_plan(2, 3)[1] == 1
 
 
 def test_a_budget_below_the_rung_count_keeps_every_rung_alive(capsys):
     # Three rungs cannot run on two threads: a rung with zero threads is not a
-    # slower rung, it is a broken command. The floor is honoured and reported
-    # rather than silently exceeded.
+    # slower rung, it is an unbounded one, since ffmpeg reads zero as "pick for
+    # yourself". The floor is honoured and reported rather than silently
+    # exceeded -- overrunning the budget by one core is the smaller harm.
     per_rung, _ = thread_plan(2, 3)
     assert per_rung == [1, 1, 1]
     out = capsys.readouterr().out
@@ -208,6 +212,12 @@ def test_a_cgroup_quota_wins_over_the_host_core_count(monkeypatch):
         raise OSError("not here")
 
     monkeypatch.setattr(mod.Path, "read_text", fake_read_text)
+    # Same reason as the v1 test below: without pinning what the code falls
+    # through to, deleting the cgroup read leaves the assertion satisfied by the
+    # host's own count on any four-CPU machine, which is what `ubuntu-latest`
+    # is. The mutation would die here and survive in CI.
+    monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(9)),
+                        raising=False)
     assert mod.available_cpus() == 4
     assert mod.parse_cpu_budget("50%") == 2
 
@@ -226,15 +236,17 @@ def test_an_unlimited_cgroup_falls_through_to_the_real_core_count(monkeypatch):
     # raising=False because sched_getaffinity is Linux-only: on macOS the
     # attribute does not exist and monkeypatch would fail the test before it
     # ran. The production guard for that same absence is a real one and is
-    # covered by its own test below.
+    # covered by
+    # `test_a_host_without_sched_getaffinity_falls_back_to_the_core_count`
+    # below, which did not exist when this sentence was first written.
     monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(12)),
                         raising=False)
     assert mod.available_cpus() == 12
 
 
 def test_a_sub_core_quota_still_yields_one(monkeypatch):
-    # `cpus: "0.5"` is legal. Zero threads is not a slower encode, it is a
-    # broken command.
+    # `cpus: "0.5"` is legal. A budget of zero is not a slower encode, it is an
+    # unbounded one: ffmpeg reads a zero thread count as "pick for yourself".
     import packages.transcoder.ffmpeg_transcoder as mod
 
     def fake_read_text(self, *args, **kwargs):
@@ -305,3 +317,17 @@ def test_an_unreadable_quota_falls_through_rather_than_raising(monkeypatch):
     monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(3)),
                         raising=False)
     assert mod.available_cpus() == 3
+
+
+def test_a_host_without_sched_getaffinity_falls_back_to_the_core_count(monkeypatch):
+    # The production guard behind every `raising=False` in this file. On a host
+    # with no `sched_getaffinity` -- macOS, Windows -- the attribute lookup
+    # raises `AttributeError` rather than returning anything, so the except
+    # clause has to name it or the worker dies on import of its own core count.
+    # Nothing exercised this on Linux, where the attribute always exists.
+    import packages.transcoder.ffmpeg_transcoder as mod
+
+    monkeypatch.setattr(mod.Path, "read_text", _only_v1("\n"))   # no cgroup
+    monkeypatch.delattr(mod.os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(mod.os, "cpu_count", lambda: 7)
+    assert mod.available_cpus() == 7
