@@ -709,6 +709,93 @@ def parse_progress_percent(line: str, duration_seconds: float | None) -> int | N
     return max(0, min(99, percent))
 
 
+class TranscodeTruncated(RuntimeError):
+    """ffmpeg reported success but wrote less than the source holds.
+
+    Its own subclass because a truncated result must not be absorbed by the
+    fallbacks below. A remux that fails for a reason of its own is worth
+    encoding instead; a remux that stopped early is worth *reading again*,
+    which is what a task retry does and a fallback does not.
+    """
+
+
+# How far short of the source the output may fall before it counts as truncated
+# rather than rounded. The last segment is cut wherever the frames end, and a
+# copy's segment boundaries come from the source's GOP, so an exact match is
+# not on offer; every finished ladder measured on a live instance landed within
+# a frame or two of its source.
+_TRUNCATION_SLACK_SECONDS = 3.0
+_TRUNCATION_SLACK_SHARE = 0.01
+
+
+def hls_output_seconds(hls_dir: Path) -> Optional[float]:
+    """How long the longest variant in a finished HLS directory actually is.
+
+    Read from the playlists, which are the only place the muxer records what it
+    wrote. Counting segments would not do: their length varies with the frame
+    rate, and on the copy path it follows the source's GOP rather than
+    `-hls_time`.
+
+    Returns None when there is no playlist at all, which is its own kind of
+    failure and is reported as one by the caller.
+    """
+    longest: Optional[float] = None
+    for playlist in sorted(hls_dir.glob("*/playlist.m3u8")):
+        total = 0.0
+        for line in playlist.read_text(errors="replace").splitlines():
+            if not line.startswith("#EXTINF:"):
+                continue
+            try:
+                total += float(line.split(":", 1)[1].split(",")[0])
+            except ValueError:
+                continue  # a malformed line is not a reason to lose the rest
+        longest = total if longest is None else max(longest, total)
+    return longest
+
+
+def refuse_a_truncated_result(
+    hls_dir: Path, source_seconds: Optional[float], label: str = "ffmpeg"
+) -> None:
+    """Raise unless the ladder just written is as long as the source.
+
+    ffmpeg's exit code does not answer this. If the input stops being readable
+    at a frame boundary -- a dropped read, an object the store has not finished
+    assembling -- the demuxer sees an ordinary end of file, the muxer closes the
+    playlist with `#EXT-X-ENDLIST`, and ffmpeg exits 0. Measured on a 31:18
+    master cut at three successive frame boundaries: 92.4s, 96.1s and 99.8s of
+    output, exit 0 every time, every playlist well-formed. Cut a byte *inside* a
+    frame instead and ffmpeg exits 183, which is why this is rare and why it
+    survived being rare: the failure that reports itself is the common one.
+
+    A live instance carried such a version for two days. The database had
+    `ready` and the source's real duration side by side with 5% of it in the
+    bucket, and it took someone dragging the scrubber to the end to notice.
+
+    The source is not what is damaged -- it is whole in the store and the
+    download served from it was always complete -- so the remedy is to read it
+    again, which is what failing here arranges.
+    """
+    if not source_seconds or source_seconds <= 0:
+        return  # nothing to compare against; probing failed earlier and said so
+    written = hls_output_seconds(hls_dir)
+    if written is None:
+        # No playlist at all is not judged here. ffmpeg with an HLS muxer either
+        # writes one or exits non-zero, so in production this branch means the
+        # layout moved, not that a transcode failed -- and failing every asset
+        # over a renamed directory is the worse error. `test_the_check_is_wired
+        # _into_the_transcode` is what keeps this from being a quiet way for the
+        # whole check to stop applying.
+        return
+    slack = max(_TRUNCATION_SLACK_SECONDS, source_seconds * _TRUNCATION_SLACK_SHARE)
+    if written < source_seconds - slack:
+        raise TranscodeTruncated(
+            f"{label} exited 0 after writing {written:.1f}s of a "
+            f"{source_seconds:.1f}s source ({written / source_seconds:.0%}); "
+            "the read ended early and the result would have been stored as "
+            "complete"
+        )
+
+
 # Segments are uploaded by a small pool of threads rather than one after the
 # other. A PUT to a remote object store costs most of a round-trip whatever it
 # carries, and a 50-minute encode at the default segment length produces on the
@@ -1599,8 +1686,25 @@ class FFmpegTranscoder(BaseTranscoder):
                         )
                     else:
                         self._run(ffmpeg_cmd, timeout=14400, label="ffmpeg")
+                    # Exit 0 is not the same as "wrote the whole source" -- see
+                    # refuse_a_truncated_result. Checked before the backend is
+                    # accepted, so a short ladder is never uploaded and never
+                    # reaches the database as `ready`.
+                    refuse_a_truncated_result(
+                        hls_dir,
+                        meta.duration_seconds if meta else None,
+                        label=f"ffmpeg ({attempt_backend})",
+                    )
                     backend = attempt_backend
                     break
+                except TranscodeTruncated:
+                    # Deliberately not absorbed by the fallbacks below. The
+                    # source is intact, so the useful move is to read it again:
+                    # the task retries in a minute, and the next read is a fresh
+                    # connection to an object the store has certainly finished
+                    # assembling. Degrading to the encoder would re-read the
+                    # same input the same way and cost hours doing it.
+                    raise
                 except RuntimeError as exc:
                     is_last = attempt_index == len(attempts) - 1
                     remux = attempt_backend == "copy"
