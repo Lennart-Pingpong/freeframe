@@ -29,6 +29,9 @@ def test_a_core_count_is_taken_as_written():
 
 def test_surrounding_whitespace_is_tolerated():
     # Pasted out of a compose file, this is what an operator actually types.
+    # Pinning the contract, not the `.strip()`: `int()` strips for itself, so
+    # removing that call leaves this green. What it does redden is the blank
+    # case and the `%` suffix check, which have their own tests.
     assert parse_cpu_budget("  6  ", cpu_count=16) == 6
 
 
@@ -75,6 +78,9 @@ def test_a_comma_decimal_is_accepted():
 
 
 def test_whitespace_inside_a_share_is_tolerated():
+    # The space before the `%` is `float()`'s to strip, not ours; the space
+    # after it is what the outer strip has to remove before `endswith("%")`
+    # can see the suffix, and that is the half of this the test can redden.
     assert parse_cpu_budget(" 25 % ", cpu_count=16) == 4
 
 
@@ -119,6 +125,18 @@ def test_an_unusable_value_falls_back_and_reports(raw, capsys):
 def test_a_value_leaving_no_cores_falls_back_and_reports(raw, capsys):
     assert parse_cpu_budget(raw, cpu_count=16) is None
     assert "would leave no cores" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("raw", ["nan%", "inf%", "Infinity%", "-inf%"])
+def test_a_share_that_is_not_a_number_falls_back_rather_than_raising(raw, capsys):
+    # The typo cases above are all strings `float()` rejects. These four it
+    # accepts, and three of them used to reach `round()`, where NaN raises
+    # ValueError and inf raises OverflowError. Nothing between there and the
+    # job's outer handler catches either, so a single mistyped share failed
+    # every upload at 0% with an error that never named this setting -- the
+    # exact outcome the fallback exists to prevent.
+    assert parse_cpu_budget(raw, cpu_count=16) is None
+    assert "TRANSCODER_CPU_LIMIT" in capsys.readouterr().out
 
 
 # ------------------------------------------------------------- the thread plan
@@ -215,7 +233,10 @@ def test_a_cgroup_quota_wins_over_the_host_core_count(monkeypatch):
     # Same reason as the v1 test below: without pinning what the code falls
     # through to, deleting the cgroup read leaves the assertion satisfied by the
     # host's own count on any four-CPU machine, which is what `ubuntu-latest`
-    # is. The mutation would die here and survive in CI.
+    # is, so the mutation would die on a roomy dev box and survive here. CI
+    # would still have gone red, by way of `test_a_sub_core_quota_still_yields_one`
+    # -- the point is that this test, which is named for the quota, has to be
+    # the one that catches it.
     monkeypatch.setattr(mod.os, "sched_getaffinity", lambda _pid: set(range(9)),
                         raising=False)
     assert mod.available_cpus() == 4

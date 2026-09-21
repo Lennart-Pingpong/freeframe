@@ -145,6 +145,34 @@ def test_a_single_rung_receives_the_whole_budget(monkeypatch):
     assert _threads_for(cmd) == {"-threads:v:0": "6"}
 
 
+def test_the_remainder_reaches_the_rung_it_was_given_to(monkeypatch):
+    # Every other budget in this file divides evenly across its rungs, which
+    # leaves the index that maps plan entry i to `-threads:v:i` unpinned:
+    # collapsing it to `cpu_plan[0][0]` emits 9 encoder threads on a 7-core
+    # budget and reddens nothing. The uneven case is the only one that can see
+    # it, and the policy it checks is documented in `thread_plan` -- the
+    # remainder goes to the earliest rungs, which are the largest.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "7")
+    cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"])
+
+    assert _threads_for(cmd) == {
+        "-threads:v:0": "3", "-threads:v:1": "2", "-threads:v:2": "2",
+    }
+
+
+def test_the_plan_is_sized_from_the_ladder_that_survives_pruning(monkeypatch):
+    # The call site's one load-bearing assumption: rungs above the source are
+    # dropped before `thread_plan` is asked how many there are. Sizing it from
+    # the requested ladder instead -- `requested` is the other name in scope on
+    # the same screen -- hands this upload 2 threads of the 6 it was granted,
+    # on every source below the top rung, and every other test here uses a
+    # 1080p source where the two lists are identical.
+    monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "6")
+    cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"], source=(640, 360))
+
+    assert _threads_for(cmd) == {"-threads:v:0": "6"}
+
+
 def test_a_share_is_resolved_against_what_is_available(monkeypatch):
     monkeypatch.setattr(
         "packages.transcoder.ffmpeg_transcoder.available_cpus", lambda: 16
@@ -268,10 +296,20 @@ def test_a_stream_copy_gets_no_thread_arguments(monkeypatch):
 def test_a_stream_copy_cannot_be_short_of_threads(monkeypatch, capsys):
     # Worth pinning because it is the reason the plan can be computed before the
     # path is chosen: a copy only happens once the ladder has resolved to a
-    # single rung, and one rung is never short. If the copy gate ever widens to
-    # a real ladder, this fails and the plan has to move.
+    # single rung, and one rung is never short.
+    #
+    # Silence only means something if the warning is live at this budget, so the
+    # encode that does warn is asserted first -- without it, deleting the
+    # shortfall report entirely left this test green. And it is NOT the guard
+    # against the copy gate widening to a real ladder: the gate is what decides
+    # the rung count this test sees, so it cannot reach that mutation.
+    # `test_source_copy.py::test_a_configured_ladder_still_gets_every_rung_it_asked_for`
+    # is the one that catches it.
     monkeypatch.setenv("TRANSCODER_CPU_LIMIT", "1")
     capsys.readouterr()
+
+    _transcode(["1080p", "720p", "360p"], source=(1920, 1080))
+    assert "need one thread each" in capsys.readouterr().out
 
     cmd, result, _ = _transcode(["1080p"], source=(1920, 1080))
 

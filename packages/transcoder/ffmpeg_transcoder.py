@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import select
 import shutil
@@ -385,6 +386,15 @@ def parse_cpu_budget(raw: str | None, cpu_count: int | None = None) -> Optional[
         try:
             share = float(text[:-1].strip().replace(",", "."))
         except ValueError:
+            share = float("nan")
+        # Not-a-number covers both the strings float() rejects and the three it
+        # accepts and should not. "nan", "inf" and "infinity" get past a
+        # ValueError check and then raise inside round() below, ValueError for
+        # NaN and OverflowError for inf, and nothing between there and the job's
+        # outer handler catches either -- so one mistyped share failed every
+        # upload at 0% with an error that never named this setting, which is the
+        # outcome falling back to unbounded exists to prevent.
+        if not math.isfinite(share):
             print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is not a percentage; "
                   "leaving CPU use unbounded", flush=True)
             return None
@@ -445,8 +455,8 @@ def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[i
         4K, scale only     30.4 s / 2.99    16.2 s / 5.87   10.7 s / 9.02
         4K HDR, tone-map  101.5 s / 1.65    51.1 s / 3.68   30.5 s / 6.44
 
-    Half the budget is the largest share that stays inside the cap on all three. The
-    whole budget is 1.5x faster again and overruns it on both 4K sources, by
+    Half the budget is the largest share tried that stayed inside the cap on all
+    three. The whole budget is 1.5x faster again and overruns it on both 4K sources, by
     0.44 cores on the tone-map graph and by 3.0 on the scaling one. One thread
     holds the cap only by wasting it: the operator granted six cores and the job
     takes 1.65. On the 1080p source, where the first measurement was taken, the
@@ -471,17 +481,22 @@ def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[i
         H.264                  5.8 CPU-s     4.45 cores   5.92 cores
         ProRes 4444 XQ        24.0 CPU-s     5.47 cores   7.70 cores
 
-    Only the last cell is over, and it is over by 28%. The sources above are all
-    H.264 and all three-rung, which is why they all held. A shorter ladder and a
-    faster machine both shrink the divisor, so `TRANSCODER_QUALITIES` trimmed to
-    one rung is the configuration where this leaks most -- and an upstream report
-    on an 11-core host measured 7.46 cores for a ProRes master at three rungs,
-    where this host measured 5.47.
+    Only the last cell is over, and it is over by 28%. The three sources in the
+    first table held for the length of their jobs rather than for their codec:
+    two of those rows are one ProRes 422 HQ 10-bit master (`4K, scale only` is
+    that file with `TRANSCODER_HDR=preserve`), and at half the budget they run
+    16.2s and 51.1s, which is long enough to spread even that decode thin. A
+    shorter ladder and a faster machine both shrink the divisor, so
+    `TRANSCODER_QUALITIES` trimmed to one rung is the configuration where this
+    leaks most -- and an upstream report (#390) on an 11-core host, with a real
+    NLE export rather than a master built to match one, measured 7.46 cores at
+    three rungs where this host measured 5.47.
 
     Capping the decoder is not the fix. `-threads` before `-i` does reach it, and
     on the full job it moved occupancy by less than the run-to-run spread, here
-    and on the reporting host, because the decoder is not what the pipeline is
-    waiting on.
+    and on the reporting host -- not because the decoder is cheap, but because
+    the option is a loose bound on a codec that threads on frame and slice
+    level: `-threads 2` was measured at 4.61 cores, not 2.
 
     Every rung keeps at least one thread, so `n` rungs cannot go below `n`
     encoder threads. A budget under the rung count is honoured as closely as it
