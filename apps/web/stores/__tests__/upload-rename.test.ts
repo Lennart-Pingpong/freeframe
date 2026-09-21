@@ -169,9 +169,11 @@ describe('rows that may not be renamed', () => {
   })
 
   it('a history row, which is not proof of the role the rename needs', async () => {
-    // History comes from `/me/assets`, which spans every project the user can
-    // see in whatever role they hold there. A reviewer renaming their own
-    // upload history would get a 403 from an edit the UI had offered them.
+    // History comes from `/me/assets?filter=owned`, so the rows are the user's
+    // own assets. Creating one is still not proof of holding the editor role
+    // today: that query has no membership term, so an asset outlives the
+    // demotion or removal that took the right to rename it, and the UI would be
+    // offering an edit that answers 403.
     seed(row({ id: 'history-a1', fromHistory: true, status: 'complete' }))
 
     const error = await useUploadStore.getState().renameUpload('history-a1', 'Ep04')

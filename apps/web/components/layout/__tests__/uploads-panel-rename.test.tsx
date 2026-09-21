@@ -167,11 +167,11 @@ describe('a row that has not reached the server yet', () => {
 describe('rows the panel does not offer a rename on', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('a history row, which may belong to a project the user only reviews', () => {
-    // `/me/assets` is not "my uploads": with no filter it returns every asset
-    // in every project the user is a member of, in whatever role, plus
-    // anything merely shared or assigned to them. Most of that list is not
-    // theirs to rename.
+  it('a history row, which may belong to a project the user no longer edits', () => {
+    // `/me/assets?filter=owned` is the user's own assets, which is not the same
+    // as assets they may still edit: that query has no membership term, so an
+    // asset created before a demotion or a removal still comes back and the
+    // rename could only answer 403.
     open(row({ id: 'history-a1', fromHistory: true, status: 'complete' }))
     // A completed row is not on the Active tab the panel opens on, and a
     // control cannot be absent from a row that was never rendered.
@@ -186,15 +186,15 @@ describe('where the history flag comes from', () => {
   // The guards above are pinned; the thing that sets the flag was not. Deleting
   // `fromHistory: true` from `mergeHistoryAssets` left the whole suite green
   // while, in the app, every row on the Complete tab grew a pencil that answers
-  // 403 for anyone reviewing a project they are not an editor on. So this test
-  // goes through `/me/assets` rather than building the row by hand.
+  // 403 for anyone whose editor role on that project has since gone. So this
+  // test goes through `/me/assets` rather than building the row by hand.
   beforeEach(() => vi.clearAllMocks())
 
   it('marks a row that came back from /me/assets', async () => {
     vi.mocked(api.get).mockResolvedValue([
       {
         id: 'a9',
-        name: 'Someone elses cut',
+        name: 'A cut they no longer edit',
         project_id: 'p2',
         asset_type: 'video',
         latest_version: {
@@ -215,7 +215,7 @@ describe('where the history flag comes from', () => {
     render(<UploadsPanel />)
     fireEvent.click(screen.getByRole('button', { name: /Complete/ }))
 
-    expect(screen.getByText('Someone elses cut')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Rename Someone elses cut' })).toBeNull()
+    expect(screen.getByText('A cut they no longer edit')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Rename A cut they no longer edit' })).toBeNull()
   })
 })

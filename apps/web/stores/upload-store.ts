@@ -533,11 +533,12 @@ export interface UploadFile {
   /**
    * True for a row rebuilt from `/me/assets` rather than started here.
    *
-   * That endpoint spans every project the user can see, in whatever role they
-   * hold there, so a history row is not proof of the `editor` role that
-   * renaming needs -- a reviewer's own history is full of assets they cannot
-   * touch. A row this session started is proof, because starting it required
-   * the same role.
+   * These rows are the user's own assets now that the panel asks with
+   * `filter=owned`, but being an asset's creator is not proof of the `editor`
+   * role that renaming needs. That filter carries no membership term at all, so
+   * an asset comes back long after the role that created it was demoted or the
+   * membership removed, and the rename would answer 403. A row this session
+   * started is proof, because starting it required the same role.
    */
   fromHistory?: boolean
   /** Why a rename that happened without the user watching was refused. The
