@@ -15,12 +15,41 @@ from botocore.config import Config
 from .base import BaseTranscoder, TranscodeJob, TranscodeResult, VideoMetadata
 
 
+def _tag_duration_seconds(stream: dict) -> Optional[float]:
+    """Seconds from a Matroska `DURATION` stream tag, or None.
+
+    Matroska and WebM carry no per-stream `duration` field; the muxer writes the
+    track's length as a tag instead, formatted `HH:MM:SS.nnnnnnnnn`. ffmpeg
+    writes it, and it may be suffixed with a language (`DURATION-eng`).
+    """
+    for key, value in (stream.get("tags") or {}).items():
+        if not key.upper().startswith("DURATION"):
+            continue
+        parts = str(value).split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            hours, minutes, seconds = (float(p) for p in parts)
+        except ValueError:
+            continue
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            return total
+    return None
+
+
 def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
     """Parse ffprobe JSON into the metadata persisted by v1.5.
 
     Returns None when no video stream exists.  A zero/invalid frame rate stays
     zero rather than inventing a value, and format-level duration is used when
     the video stream does not provide one.
+
+    `duration_seconds` stays the container's answer, because that is what the
+    player, the database and the comment timecodes mean by "how long is this".
+    `video_duration_seconds` is the picture track alone, and is None when the
+    file does not say: the two differ whenever a stream outlives the video, and
+    a caller that needs the video timeline must not be handed the other one.
     """
     streams = data.get("streams") or []
     if not streams:
@@ -35,7 +64,9 @@ def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
                 fps = float(num) / float(den)
         except ValueError:
             fps = 0.0
-    duration = float(stream.get("duration") or 0)
+    stream_duration = float(stream.get("duration") or 0) or None
+    video_duration = stream_duration or _tag_duration_seconds(stream)
+    duration = stream_duration or 0.0
     if not duration:
         duration = float((data.get("format") or {}).get("duration") or 0)
     return VideoMetadata(
@@ -43,6 +74,7 @@ def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
         width=int(stream.get("width") or 0),
         height=int(stream.get("height") or 0),
         fps=fps,
+        video_duration_seconds=video_duration,
     )
 
 
@@ -721,11 +753,21 @@ class TranscodeTruncated(RuntimeError):
 
 # How far short of the source the output may fall before it counts as truncated
 # rather than rounded. The last segment is cut wherever the frames end, and a
-# copy's segment boundaries come from the source's GOP, so an exact match is
-# not on offer; every finished ladder measured on a live instance landed within
-# a frame or two of its source.
+# copy's segment boundaries come from the source's GOP, so an exact match is not
+# on offer.
+#
+# A flat number rather than a share of the duration, because the drift it covers
+# is flat. Measured against the video track's own duration on 1-, 10- and
+# 40-minute sources, both paths:
+#
+#     copy    +0.0230s   at every length
+#     encode  -0.0400s   at every length
+#
+# It is a rounding remainder in the last segment, so it does not grow with the
+# file. A proportional term would grow anyway -- 24s of blindness on a
+# 40-minute master, 36s on an hour -- and buy nothing: 3s is already 75 times
+# the largest drift measured.
 _TRUNCATION_SLACK_SECONDS = 3.0
-_TRUNCATION_SLACK_SHARE = 0.01
 
 
 def hls_output_seconds(hls_dir: Path) -> Optional[float]:
@@ -754,9 +796,17 @@ def hls_output_seconds(hls_dir: Path) -> Optional[float]:
 
 
 def refuse_a_truncated_result(
-    hls_dir: Path, source_seconds: Optional[float], label: str = "ffmpeg"
+    hls_dir: Path, source_video_seconds: Optional[float], label: str = "ffmpeg"
 ) -> None:
-    """Raise unless the ladder just written is as long as the source.
+    """Raise unless the ladder just written is as long as the source's video.
+
+    The argument is the *video track's* duration, not the file's, and the name
+    says so because handing it the wrong one is silent and wrong rather than
+    loud: `#EXTINF` measures picture, a container's duration is its longest
+    stream, and a rough cut whose audio runs past its last frame would be
+    refused at 57% while being perfectly intact. `VideoMetadata` carries both
+    numbers separately for this reason. None when the source does not say,
+    which is not judged -- see below.
 
     ffmpeg's exit code does not answer this. If the input stops being readable
     at a frame boundary -- a dropped read, an object the store has not finished
@@ -775,8 +825,13 @@ def refuse_a_truncated_result(
     download served from it was always complete -- so the remedy is to read it
     again, which is what failing here arranges.
     """
-    if not source_seconds or source_seconds <= 0:
-        return  # nothing to compare against; probing failed earlier and said so
+    if not source_video_seconds or source_video_seconds <= 0:
+        # Nothing trustworthy to compare against: either probing failed and said
+        # so already, or the container does not publish a video-track duration
+        # (Matroska without a DURATION tag). Guessing with the container's
+        # duration instead is what would refuse intact files, so this declines
+        # to judge rather than judging on the wrong number.
+        return
     written = hls_output_seconds(hls_dir)
     if written is None:
         # No playlist at all is not judged here. ffmpeg with an HLS muxer either
@@ -786,11 +841,11 @@ def refuse_a_truncated_result(
         # _into_the_transcode` is what keeps this from being a quiet way for the
         # whole check to stop applying.
         return
-    slack = max(_TRUNCATION_SLACK_SECONDS, source_seconds * _TRUNCATION_SLACK_SHARE)
-    if written < source_seconds - slack:
+    if written < source_video_seconds - _TRUNCATION_SLACK_SECONDS:
         raise TranscodeTruncated(
             f"{label} exited 0 after writing {written:.1f}s of a "
-            f"{source_seconds:.1f}s source ({written / source_seconds:.0%}); "
+            f"{source_video_seconds:.1f}s source "
+            f"({written / source_video_seconds:.0%}); "
             "the read ended early and the result would have been stored as "
             "complete"
         )
@@ -1692,7 +1747,7 @@ class FFmpegTranscoder(BaseTranscoder):
                     # reaches the database as `ready`.
                     refuse_a_truncated_result(
                         hls_dir,
-                        meta.duration_seconds if meta else None,
+                        meta.video_duration_seconds if meta else None,
                         label=f"ffmpeg ({attempt_backend})",
                     )
                     backend = attempt_backend
