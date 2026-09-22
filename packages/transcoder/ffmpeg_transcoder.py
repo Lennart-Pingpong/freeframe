@@ -1200,36 +1200,47 @@ class FFmpegTranscoder(BaseTranscoder):
             )
         return None
 
-    def _probe_video_end(
-        self, input_url: str, stream: dict, near_seconds: Optional[float]
+    def _probe_expected_video_seconds(
+        self, input_url: str, stream: dict, claim: Optional[float]
     ) -> Optional[float]:
-        """Where the picture ends, for containers that do not publish it.
+        """How much video the source says it holds, when it says it only once.
 
-        Measured across the containers an upload actually arrives in: FLV never
-        carries a per-stream video duration -- not when remuxed, not when
+        FLV publishes no per-stream video duration at all -- not remuxed, not
         re-encoded -- and a Matroska or WebM written to a pipe, which is what a
-        live recorder and a browser capture produce, carries neither that nor a
-        `DURATION` tag. Without a number `refuse_a_truncated_result` declines,
-        which would leave it permanently inert for a whole family of files: a
-        check that is silently off is the shape of bug this feature exists to
-        catch, so it is worth one probe to avoid.
+        live recorder and a browser capture produce, publishes neither that nor
+        a `DURATION` tag. Declining for those would leave the check permanently
+        inert for a whole family of uploads, which is the shape of bug it exists
+        to catch.
 
-        Costs a single ranged read of the tail, and only for those containers --
-        everything that publishes a duration never reaches here. Returns None
-        when it cannot say, including when there is no container duration to aim
-        the window at, which is the honestly undecidable case.
+        What is left is the container's own duration, and the question is what
+        that number is about. One ranged probe of the tail answers it, because
+        the three cases look different -- all measured on real files:
+
+            file                 last picture   last packet   container says
+            intact FLV               120.0         120.0          120.0
+            FLV cut at 30%            35.9          35.9          120.0
+            mkv with an audio tail    30.0          90.0           90.0
+
+        A file that does not reach its own claim was cut short, and the claim is
+        still what it was supposed to hold. A file that does reach it, with the
+        picture ending earlier, has an audio tail and its ladder is complete at
+        the picture's length. Only the third shape -- readable to the end, with
+        no picture anywhere in the window -- is undecidable, and declines.
+
+        Costs one probe, and only for containers that publish no video duration;
+        everything else never reaches here.
         """
-        if not near_seconds or near_seconds <= 0:
-            return None
-        start = max(0.0, near_seconds - _VIDEO_END_PROBE_SECONDS)
+        if not claim or claim <= 0:
+            return None            # nothing to aim the window at, and no claim
+        start = max(0.0, claim - _VIDEO_END_PROBE_SECONDS)
         interval = (f"{start:g}%+{_VIDEO_END_PROBE_SECONDS * 2:g}" if start > 0
                     else f"%+{_VIDEO_END_PROBE_SECONDS * 2:g}")
         try:
             probed = self._run(
                 [
-                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "ffprobe", "-v", "error",
                     "-read_intervals", interval,
-                    "-show_entries", "packet=pts_time,duration_time",
+                    "-show_entries", "packet=pts_time,codec_type",
                     "-print_format", "json", input_url,
                 ],
                 timeout=300, label="ffprobe",
@@ -1242,21 +1253,24 @@ class FFmpegTranscoder(BaseTranscoder):
             print(f"[transcoder] could not probe where the video ends: {exc}", flush=True)
             return None
 
-        end: Optional[float] = None
+        last_picture: Optional[float] = None
+        last_packet: Optional[float] = None
         for packet in packets:
             try:
                 moment = float(packet.get("pts_time"))
             except (TypeError, ValueError):
                 continue
-            try:
-                moment += float(packet.get("duration_time") or 0)
-            except (TypeError, ValueError):
-                pass  # one frame either way is far inside the slack
-            end = moment if end is None else max(end, moment)
-        if end is None:
-            return None
-        length = end - _stream_start_seconds(stream)
-        return length if length > 0 else None
+            last_packet = moment if last_packet is None else max(last_packet, moment)
+            if packet.get("codec_type") == "video":
+                last_picture = (moment if last_picture is None
+                                else max(last_picture, moment))
+
+        offset = _stream_start_seconds(stream)
+        if last_packet is None or last_packet < claim - _TRUNCATION_SLACK_SECONDS:
+            return (claim - offset) or None        # cut short of its own claim
+        if last_picture is None:
+            return None                            # readable, but no picture here
+        return (last_picture - offset) or None
 
     def _upload_directory(self, source_dir: Path, s3_prefix: str) -> list[str]:
         """Upload every file under `source_dir` to `s3_prefix`, several at a time.
@@ -1837,7 +1851,7 @@ class FFmpegTranscoder(BaseTranscoder):
             # from the tail when the container does not publish it.
             source_video_seconds = meta.video_duration_seconds
             if source_video_seconds is None:
-                source_video_seconds = self._probe_video_end(
+                source_video_seconds = self._probe_expected_video_seconds(
                     input_url, _vid_stream, meta.duration_seconds
                 )
 

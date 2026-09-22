@@ -464,6 +464,10 @@ def _drive_a_transcode(
         """What a run of `cmd` produces, as (returncode, stdout, stderr)."""
         commands.append(cmd)
         if cmd[0] == "ffprobe":
+            # The tail probe asks about every stream at once, so it carries no
+            # -select_streams and must be matched before the selector below.
+            if "packet=pts_time,codec_type" in cmd:
+                return 0, json.dumps({"packets": tail_packets or []}), ""
             selected = (cmd[cmd.index("-select_streams") + 1]
                         if "-select_streams" in cmd else "")
             if selected != "v:0":
@@ -485,9 +489,6 @@ def _drive_a_transcode(
                     {"pts_time": f"{start + t:.3f}", "flags": "K_"}
                     for t in range(0, int(length) + 1, 2)
                 ]}), ""
-            if "packet=pts_time,duration_time" in cmd:
-                # The tail probe, for containers that publish no video duration.
-                return 0, json.dumps({"packets": tail_packets or []}), ""
             return 0, json.dumps({"streams": [stream], "format": fmt}), ""
         if cmd[0] == "ffmpeg" and "trace_headers" in cmd:
             # Every sync sample an IDR, no recovery points: copyable. The count
@@ -692,43 +693,69 @@ def test_a_matroska_with_an_audio_tail_is_not_refused_end_to_end(tmp_path):
     assert "the read ended early" not in (result.error or "")
 
 
-def test_an_unknown_video_duration_is_probed_rather_than_guessed(tmp_path):
-    # FLV publishes no per-stream video duration at all -- not remuxed, not
-    # re-encoded -- and a Matroska written to a pipe publishes neither that nor
-    # a DURATION tag. Falling back to the container's number would refuse
-    # intact files; declining outright would leave the check permanently off
-    # for those containers, which is the shape of bug it exists to catch.
+# A container that publishes no per-stream video duration -- FLV never does,
+# nor does a Matroska written to a pipe. All that is left is the container's
+# own duration, and one probe of the tail says what that number is about. The
+# three shapes below are taken from real files; the numbers are in
+# `_probe_expected_video_seconds`.
+_NO_VIDEO_DURATION = {
+    "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
+    "width": 1920, "height": 1080,
+}
+
+
+def test_a_source_that_falls_short_of_its_own_claim_is_refused(tmp_path):
+    # The truncated-FLV shape: the container says 600s, and nothing is readable
+    # anywhere near that -- the last packet of any stream is at 60s. The file
+    # was cut short, and 600s is still what it was supposed to hold.
     #
-    # Measured end to end before this probe existed: 10% of a 300s FLV master
-    # was accepted as complete, exit code 0, exactly the original incident.
+    # Measured before this existed: 10% of a 300s FLV master was accepted as
+    # complete, exit code 0 -- the original incident, through the new check.
     result, _, commands = _drive_a_transcode(
-        tmp_path,
-        written_seconds=60.0,
-        source_seconds=600.0,
-        video_stream={
-            "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
-            "width": 1920, "height": 1080,
-        },
-        tail_packets=[{"pts_time": "599.960", "duration_time": "0.040"}],
+        tmp_path, written_seconds=60.0, source_seconds=600.0,
+        video_stream=_NO_VIDEO_DURATION,
+        tail_packets=[{"pts_time": "59.960", "codec_type": "video"},
+                      {"pts_time": "59.980", "codec_type": "audio"}],
     )
-    assert any("packet=pts_time,duration_time" in c for c in commands)
+    assert any("packet=pts_time,codec_type" in c for c in commands)
     assert result.success is False
     assert "10%" in result.error
     assert "600.0s source" in result.error
 
 
-def test_a_probed_video_end_leaves_a_complete_ladder_alone(tmp_path):
-    # The control for the probe: it must not turn into a source of false
-    # refusals of its own.
+def test_a_source_readable_to_its_claim_is_measured_not_assumed(tmp_path):
+    # The intact-FLV shape: readable right up to the claim, so the picture's
+    # own last packet is the length, and a complete ladder passes.
     result, _, _ = _drive_a_transcode(
-        tmp_path,
-        written_seconds=600.0,
-        source_seconds=600.0,
-        video_stream={
-            "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
-            "width": 1920, "height": 1080,
-        },
-        tail_packets=[{"pts_time": "599.960", "duration_time": "0.040"}],
+        tmp_path, written_seconds=600.0, source_seconds=600.0,
+        video_stream=_NO_VIDEO_DURATION,
+        tail_packets=[{"pts_time": "599.960", "codec_type": "video"},
+                      {"pts_time": "599.980", "codec_type": "audio"}],
+    )
+    assert "the read ended early" not in (result.error or "")
+
+
+def test_an_audio_tail_without_a_published_duration_is_not_a_truncation(tmp_path):
+    # The third shape, and the one that decides whether this probe is safe: the
+    # file is readable to its claimed 600s, but the picture stops at 300s
+    # because the audio runs on. The ladder is complete at 300s. Comparing
+    # against the claim would refuse it at 50%.
+    result, _, _ = _drive_a_transcode(
+        tmp_path, written_seconds=300.0, source_seconds=600.0,
+        video_stream=_NO_VIDEO_DURATION,
+        tail_packets=[{"pts_time": "299.960", "codec_type": "video"},
+                      {"pts_time": "599.980", "codec_type": "audio"}],
+    )
+    assert "the read ended early" not in (result.error or "")
+
+
+def test_a_window_with_no_picture_at_all_declines(tmp_path):
+    # Readable to the end, but the picture ended more than a probe window
+    # before it. Nothing here can say how long it ran, so nothing is claimed.
+    result, _, _ = _drive_a_transcode(
+        tmp_path, written_seconds=60.0, source_seconds=600.0,
+        video_stream=_NO_VIDEO_DURATION,
+        tail_packets=[{"pts_time": "599.980", "codec_type": "audio"}],
     )
     assert "the read ended early" not in (result.error or "")
 
@@ -738,13 +765,7 @@ def test_a_probe_that_says_nothing_declines_instead_of_failing(tmp_path):
     # the window at either. The transcode proceeds; it must not be failed for
     # the absence of a number.
     result, _, _ = _drive_a_transcode(
-        tmp_path,
-        written_seconds=60.0,
-        source_seconds=600.0,
-        video_stream={
-            "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
-            "width": 1920, "height": 1080,
-        },
-        tail_packets=[],
+        tmp_path, written_seconds=60.0, source_seconds=600.0,
+        video_stream=_NO_VIDEO_DURATION, format_duration=0.0, tail_packets=[],
     )
     assert "the read ended early" not in (result.error or "")
