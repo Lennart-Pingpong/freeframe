@@ -15,12 +15,26 @@ from botocore.config import Config
 from .base import BaseTranscoder, TranscodeJob, TranscodeResult, VideoMetadata
 
 
-def _tag_duration_seconds(stream: dict) -> Optional[float]:
+def _stream_start_seconds(stream: dict) -> float:
+    """Where a stream's first packet sits on the timeline, or 0.0."""
+    try:
+        return max(0.0, float(stream.get("start_time")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tag_end_seconds(stream: dict) -> Optional[float]:
     """Seconds from a Matroska `DURATION` stream tag, or None.
 
     Matroska and WebM carry no per-stream `duration` field; the muxer writes the
-    track's length as a tag instead, formatted `HH:MM:SS.nnnnnnnnn`. ffmpeg
-    writes it, and it may be suffixed with a language (`DURATION-eng`).
+    track's extent as a tag instead, formatted `HH:MM:SS.nnnnnnnnn`, optionally
+    suffixed with a language (`DURATION-eng`).
+
+    It is an **end timestamp**, not a length: ffmpeg writes zero-to-last-packet,
+    so a track whose first frame sits at 3s reports 33s for 30s of picture.
+    Measured on a file built for it -- `start_time 3.023`, `DURATION
+    00:00:33.023`, 750 packets at 25fps. Hence the name, and hence the
+    subtraction wherever this is used as a length.
     """
     for key, value in (stream.get("tags") or {}).items():
         if not key.upper().startswith("DURATION"):
@@ -45,11 +59,15 @@ def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
     zero rather than inventing a value, and format-level duration is used when
     the video stream does not provide one.
 
-    `duration_seconds` stays the container's answer, because that is what the
-    player, the database and the comment timecodes mean by "how long is this".
-    `video_duration_seconds` is the picture track alone, and is None when the
-    file does not say: the two differ whenever a stream outlives the video, and
-    a caller that needs the video timeline must not be handed the other one.
+    `duration_seconds` is left exactly as it was -- the video stream's own
+    duration where the container publishes one, the format's otherwise -- since
+    it is what reaches the database and the comment timecodes, and changing it
+    is not this function's business.
+
+    `video_duration_seconds` is new, and is the picture track's length and
+    nothing else. None when the file does not say, which is a real answer: the
+    two numbers differ whenever another stream outlives the video, and a caller
+    that needs the video timeline must not be handed the other one by default.
     """
     streams = data.get("streams") or []
     if not streams:
@@ -65,7 +83,17 @@ def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
         except ValueError:
             fps = 0.0
     stream_duration = float(stream.get("duration") or 0) or None
-    video_duration = stream_duration or _tag_duration_seconds(stream)
+    video_duration = stream_duration
+    if video_duration is None:
+        tag_end = _tag_end_seconds(stream)
+        if tag_end is not None:
+            # An end timestamp, so the offset comes off. MP4 and MOV need no
+            # such correction: their per-stream `duration` is a track length,
+            # measured with `-itsoffset 3` giving start_time 3.0 alongside
+            # duration 30.0.
+            video_duration = tag_end - _stream_start_seconds(stream)
+            if video_duration <= 0:
+                video_duration = None
     duration = stream_duration or 0.0
     if not duration:
         duration = float((data.get("format") or {}).get("duration") or 0)
@@ -744,10 +772,15 @@ def parse_progress_percent(line: str, duration_seconds: float | None) -> int | N
 class TranscodeTruncated(RuntimeError):
     """ffmpeg reported success but wrote less than the source holds.
 
-    Its own subclass because a truncated result must not be absorbed by the
+    Its own type because a truncated result must not be absorbed by the
     fallbacks below. A remux that fails for a reason of its own is worth
     encoding instead; a remux that stopped early is worth *reading again*,
     which is what a task retry does and a fallback does not.
+
+    What does the passing-through is the `except TranscodeTruncated: raise`
+    placed ahead of `except RuntimeError` in the attempt loop, not the base
+    class. `RuntimeError` is kept only because every other failure the
+    transcoder raises is one, and nothing here should be the exception to that.
     """
 
 
@@ -769,6 +802,12 @@ class TranscodeTruncated(RuntimeError):
 # the largest drift measured.
 _TRUNCATION_SLACK_SECONDS = 3.0
 
+# How much of the tail to read when a container publishes no video duration at
+# all. Wide enough that the last packet is inside it even when the container's
+# own duration is a little off, and bounded so this stays a ranged request
+# rather than a second pass over a master that can be tens of gigabytes.
+_VIDEO_END_PROBE_SECONDS = 60.0
+
 
 def hls_output_seconds(hls_dir: Path) -> Optional[float]:
     """How long the longest variant in a finished HLS directory actually is.
@@ -783,14 +822,28 @@ def hls_output_seconds(hls_dir: Path) -> Optional[float]:
     """
     longest: Optional[float] = None
     for playlist in sorted(hls_dir.glob("*/playlist.m3u8")):
+        try:
+            text = playlist.read_text(errors="replace")
+        except OSError:
+            # A path that matched the glob but cannot be read -- a directory of
+            # that name, a dangling symlink. Skipping it leaves the decision to
+            # the other variants, or to "no playlist at all", both of which are
+            # handled. Letting an OSError out here would escape the attempt
+            # loop's RuntimeError handler and burn the fallbacks.
+            continue
         total = 0.0
-        for line in playlist.read_text(errors="replace").splitlines():
+        for line in text.splitlines():
             if not line.startswith("#EXTINF:"):
                 continue
             try:
-                total += float(line.split(":", 1)[1].split(",")[0])
+                seconds = float(line.split(":", 1)[1].split(",")[0])
             except ValueError:
                 continue  # a malformed line is not a reason to lose the rest
+            # `nan` fails every comparison, so a single one would make the whole
+            # check accept anything; `inf` does the same by swamping the sum.
+            if not math.isfinite(seconds):
+                continue
+            total += seconds
         longest = total if longest is None else max(longest, total)
     return longest
 
@@ -1146,6 +1199,64 @@ class FFmpegTranscoder(BaseTranscoder):
                 "every random-access point is one a player can start at"
             )
         return None
+
+    def _probe_video_end(
+        self, input_url: str, stream: dict, near_seconds: Optional[float]
+    ) -> Optional[float]:
+        """Where the picture ends, for containers that do not publish it.
+
+        Measured across the containers an upload actually arrives in: FLV never
+        carries a per-stream video duration -- not when remuxed, not when
+        re-encoded -- and a Matroska or WebM written to a pipe, which is what a
+        live recorder and a browser capture produce, carries neither that nor a
+        `DURATION` tag. Without a number `refuse_a_truncated_result` declines,
+        which would leave it permanently inert for a whole family of files: a
+        check that is silently off is the shape of bug this feature exists to
+        catch, so it is worth one probe to avoid.
+
+        Costs a single ranged read of the tail, and only for those containers --
+        everything that publishes a duration never reaches here. Returns None
+        when it cannot say, including when there is no container duration to aim
+        the window at, which is the honestly undecidable case.
+        """
+        if not near_seconds or near_seconds <= 0:
+            return None
+        start = max(0.0, near_seconds - _VIDEO_END_PROBE_SECONDS)
+        interval = (f"{start:g}%+{_VIDEO_END_PROBE_SECONDS * 2:g}" if start > 0
+                    else f"%+{_VIDEO_END_PROBE_SECONDS * 2:g}")
+        try:
+            probed = self._run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-read_intervals", interval,
+                    "-show_entries", "packet=pts_time,duration_time",
+                    "-print_format", "json", input_url,
+                ],
+                timeout=300, label="ffprobe",
+            )
+            packets = json.loads(probed).get("packets") or []
+        except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            # Never fails the transcode on its own: this exists to make a check
+            # possible, and a probe that did not work means the check declines,
+            # exactly as it did before this existed.
+            print(f"[transcoder] could not probe where the video ends: {exc}", flush=True)
+            return None
+
+        end: Optional[float] = None
+        for packet in packets:
+            try:
+                moment = float(packet.get("pts_time"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                moment += float(packet.get("duration_time") or 0)
+            except (TypeError, ValueError):
+                pass  # one frame either way is far inside the slack
+            end = moment if end is None else max(end, moment)
+        if end is None:
+            return None
+        length = end - _stream_start_seconds(stream)
+        return length if length > 0 else None
 
     def _upload_directory(self, source_dir: Path, s3_prefix: str) -> list[str]:
         """Upload every file under `source_dir` to `s3_prefix`, several at a time.
@@ -1721,6 +1832,15 @@ class FFmpegTranscoder(BaseTranscoder):
             # remux drops to the encoder rather than failing the asset, and
             # unlike the hardware case any error is reason enough: a remux has
             # no environmental failures to tell apart from input ones.
+            # What the ladder will be held against. The video track's length,
+            # never the file's -- see refuse_a_truncated_result -- and probed
+            # from the tail when the container does not publish it.
+            source_video_seconds = meta.video_duration_seconds
+            if source_video_seconds is None:
+                source_video_seconds = self._probe_video_end(
+                    input_url, _vid_stream, meta.duration_seconds
+                )
+
             attempts = [primary_backend]
             if primary_backend == "copy":
                 attempts.append(get_backend())
@@ -1747,7 +1867,7 @@ class FFmpegTranscoder(BaseTranscoder):
                     # reaches the database as `ready`.
                     refuse_a_truncated_result(
                         hls_dir,
-                        meta.video_duration_seconds if meta else None,
+                        source_video_seconds,
                         label=f"ffmpeg ({attempt_backend})",
                     )
                     backend = attempt_backend
