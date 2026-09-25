@@ -14,6 +14,28 @@ class TranscodeJob:
     # Implementations must treat it as best-effort: a raising callback must not
     # fail the transcode.
     progress_cb: Optional[Callable[[int], None]] = None
+    # True when the caller has no retry left, i.e. this is the last time the
+    # source will be read. It refers to the *task's* attempts, not to the
+    # backend fallbacks inside one transcode.
+    #
+    # It exists so that a check which cannot be certain never becomes the reason
+    # a version ends up `failed`. A ladder that comes out short is worth reading
+    # again -- a dropped read, an object the store had not finished assembling --
+    # but a source that reads short every single time must still be stored, and
+    # stored as whatever it produced: the master is the irreplaceable half, the
+    # reaper deletes the master of a `failed` version, and no measurement is
+    # worth that trade. So the check refuses while a retry is left and accepts
+    # with a loud log line when none is.
+    #
+    # Not quite absolute, and the gap is worth knowing: if the broker will not
+    # take the retry message, `process_asset` records the failure at the first
+    # attempt instead of rescheduling. That path is older than this flag and
+    # applies to every exception a transcode can raise -- but this is the first
+    # one an intact upload can produce, so the two now coincide.
+    #
+    # Defaults to False, which is the safe default for a caller that does not
+    # know: it refuses, and a caller with no retries would then see the error.
+    final_attempt: bool = False
 
 @dataclass
 class TranscodeResult:

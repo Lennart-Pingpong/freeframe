@@ -6,19 +6,31 @@ beside it. Nothing had gone wrong as far as the code could tell -- ffmpeg
 exited 0 and the playlist carried `#EXT-X-ENDLIST` -- because exit code is the
 only thing the transcoder looks at.
 
-It is reachable whenever the input stops being readable at a frame boundary:
-the demuxer cannot tell that from the end of the file. Measured on the real
+It is reachable whenever the input stops being readable part-way through: the
+demuxer reaches what looks like the end of the file. Measured on the real
 master, truncated at three successive frame boundaries, exit code 0 each time
-with 92.4s, 96.1s and 99.8s of output. Truncated one byte *inside* a frame it
-exits 183, which is why this is rare -- and why, being rare, it went unnoticed
-for two days and would have gone unnoticed longer.
+with 92.4s, 96.1s and 99.8s of output. It is not confined to a clean boundary
+either -- cut inside a video packet and the encode pipeline decodes through the
+damage and still exits 0, and a dropped HTTP read logs `Input/output error`
+before exiting 0. Only the copy pipeline reports it, exit 183 out of
+`h264_mp4toannexb`, and there the remux-to-encoder fallback absorbs it and the
+short ladder is stored anyway.
+
+The two ways to get this wrong are not symmetric, and the asymmetry decides the
+design. A ladder that is wrongly accepted can be rebuilt from a master that is
+still there. A ladder that is wrongly refused on every read lands the version on
+`failed`, and the stale-upload reaper then deletes the master -- the one copy
+that cannot be rebuilt. So refusing is only ever worth a re-read: the check
+refuses while an attempt remains and gives way, loudly, on the last one. What it
+buys is the transient case, where reading again is the whole cure.
+
+The same asymmetry runs through the metadata half of the file. Most containers
+publish a number that looks like the video track's length and is not one, so
+`video_track_seconds` declines far more often than it answers, and every
+decline below is a file that must transcode unjudged rather than be refused.
 
 Every claim here was checked by breaking the code and watching a test go red;
-the mutations are listed in the pull request. That includes the ones that are
-easy to get wrong in the other direction: a check that refuses intact files is
-worse than no check, because a refusal that reproduces on every read exhausts
-the retries, lands the version on `failed`, and the stale-upload reaper deletes
-the master a day later.
+the mutations are listed in the pull request.
 """
 import json
 import os
@@ -31,6 +43,15 @@ from packages.transcoder.ffmpeg_transcoder import (
     parse_probe_metadata,
     refuse_a_truncated_result,
 )
+
+# ffprobe reports the mov/mp4 family as one comma-joined list, and the exact
+# string matters: it is the only family whose per-stream duration is trusted.
+_MOV = "mov,mp4,m4a,3gp,3g2,mj2"
+_MKV = "matroska,webm"
+# The fragment of a refusal that no other failure produces. Asserted instead of
+# a whole sentence so a reworded message is not a red test, and instead of the
+# exception type because `transcode` turns every exception into a result.
+_REFUSED = "of ladder against a"
 
 
 def _variant(tmp_path, name: str, segment_seconds: list[float]):
@@ -48,21 +69,102 @@ def _variant(tmp_path, name: str, segment_seconds: list[float]):
 
 # ----------------------------------------- which duration the check may use
 #
-# The subtle half of this feature. `#EXTINF` measures the video timeline; a
-# container's duration is its longest stream. Comparing one against the other
-# refuses intact files, silently and only on some containers, which is the
-# worst shape a check can have.
+# The subtle half of this feature, and the half that can lose a master. Three
+# separate things all look like the video track's length and are not:
+#
+#   * a container's duration, which is its longest stream, so an audio tail
+#     reports the audio;
+#   * a per-stream duration the demuxer synthesised rather than measured -- ASF
+#     copies the file's play duration onto every stream, AVI derives it from a
+#     frame count that includes zero-size drop chunks and is a placeholder on a
+#     piped file, MPEG-PS reports a PTS span that a clock jump inflates;
+#   * a duration belonging to a stream the ladder does not encode, which is what
+#     cover art is: `v:0`, one frame, handed the whole file's length.
+#
+# So the answer is narrow on purpose. `stream.duration` counts only from the
+# mov/mp4 family, Matroska is read from its exact `DURATION` tag, and everything
+# else declines. Declining is what `main` does, and being inert is the correct
+# outcome for a check with nothing trustworthy to compare against.
 
 def test_an_mp4_reports_the_same_duration_twice():
-    # MP4, MOV and AVI carry a per-stream duration, so both numbers agree and
-    # the distinction never shows. This is the common case and the reason the
-    # bug below is easy to miss.
+    # MP4 and MOV measure the track and mean it, so both numbers agree and the
+    # distinction never shows. This is the common case, the case the incident
+    # happened on, and the reason the rest of this section is easy to miss.
     meta = parse_probe_metadata({
         "streams": [{"duration": "600.000000", "width": 1920, "height": 1080,
                      "r_frame_rate": "25/1"}],
-        "format": {"duration": "600.000000"},
+        "format": {"duration": "600.000000", "format_name": _MOV},
     })
     assert meta.duration_seconds == pytest.approx(600.0)
+    assert meta.video_duration_seconds == pytest.approx(600.0)
+
+
+@pytest.mark.parametrize("format_name, why", [
+    ("asf", "ASF/WMV copies the file's play duration onto every stream, so a "
+            "clip whose audio outlives its picture reports the audio for both"),
+    ("avi", "AVI derives it from dwLength, which counts the zero-size drop "
+            "chunks a held last frame is stored as, and which is a placeholder "
+            "when the file was written to a pipe"),
+    ("mpeg", "MPEG-PS reports the PTS span, which a clock jump between two "
+             "spliced recordings inflates without a frame to show for it"),
+    ("mpegts", "same, and a .mpg upload can be either"),
+])
+def test_a_stream_duration_from_another_demuxer_is_not_a_measurement(
+    format_name, why
+):
+    # Each of these publishes a per-stream `duration` that looks exactly like
+    # the mov/mp4 one and is not one. Trusting them refuses intact uploads of
+    # three of the seven container types the product accepts -- and a refusal
+    # that reproduces on every read costs the master.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "40.000000", "width": 640, "height": 480,
+                     "r_frame_rate": "25/1"}],
+        "format": {"duration": "40.000000", "format_name": format_name},
+    })
+    # Unchanged, because it reaches the database and the comment timecodes:
+    assert meta.duration_seconds == pytest.approx(40.0)
+    # But not offered as something to hold a ladder against:
+    assert meta.video_duration_seconds is None, why
+
+
+def test_a_wmv_whose_audio_outlives_its_picture_is_not_judged():
+    # The concrete file behind the parametrisation above: 30s of picture, 40s of
+    # audio, and the ASF demuxer reporting 40s for the video stream. Judging on
+    # that number refuses a perfectly good upload at 75%.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "40.000000", "width": 640, "height": 480,
+                     "r_frame_rate": "25/1", "start_time": "0.000000"}],
+        "format": {"duration": "40.000000", "format_name": "asf"},
+    })
+    assert meta.video_duration_seconds is None
+
+
+@pytest.mark.parametrize("format_name", [_MOV, _MKV])
+def test_cover_art_has_no_timeline(format_name):
+    # An audio file with artwork carries the picture as `v:0`, and the demuxer
+    # gives that one frame the whole file's duration -- so a ladder of one frame
+    # would be held against the album's length. mutagen writes `udta` ahead of
+    # `trak`, so anything built on it (yt-dlp's embed-thumbnail, beets, Picard)
+    # puts a real video in the same position.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 600, "height": 600,
+                     "r_frame_rate": "90000/1", "codec_name": "mjpeg",
+                     "disposition": {"attached_pic": 1},
+                     "tags": {"DURATION": "00:10:00.000000000"}}],
+        "format": {"duration": "600.000000", "format_name": format_name},
+    })
+    assert meta.video_duration_seconds is None
+
+
+def test_an_ordinary_video_stream_is_not_mistaken_for_cover_art():
+    # The mirror, so the disposition check cannot be inverted or widened to
+    # every disposition key without a test noticing.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 1920, "height": 1080,
+                     "r_frame_rate": "25/1",
+                     "disposition": {"attached_pic": 0, "default": 1}}],
+        "format": {"duration": "600.000000", "format_name": _MOV},
+    })
     assert meta.video_duration_seconds == pytest.approx(600.0)
 
 
@@ -75,7 +177,7 @@ def test_matroska_reports_the_video_track_separately_from_the_file():
         "streams": [{"width": 1920, "height": 1080, "r_frame_rate": "25/1",
                      "start_time": "0.000000",
                      "tags": {"DURATION": "00:00:20.023000000"}}],
-        "format": {"duration": "35.023000"},
+        "format": {"duration": "35.023000", "format_name": _MKV},
     })
     # What the player, the database and the comment timecodes mean by "long":
     assert meta.duration_seconds == pytest.approx(35.023)
@@ -90,14 +192,12 @@ def test_the_duration_tag_is_an_end_timestamp_and_the_offset_comes_off():
     #
     # Built with ffmpeg and probed: `-itsoffset 3` gives start_time 3.023 and
     # DURATION 00:00:33.023 for 750 packets at 25fps, which is 30.0s of
-    # picture. Without the subtraction a complete ladder is refused at 91%,
-    # and -- because a metadata mismatch reproduces on every read -- the upload
-    # ends at `failed` and its master is reaped.
+    # picture. Without the subtraction a complete ladder is refused at 91%.
     meta = parse_probe_metadata({
         "streams": [{"width": 320, "height": 240, "r_frame_rate": "25/1",
                      "start_time": "3.023000",
                      "tags": {"DURATION": "00:00:33.023000000"}}],
-        "format": {"duration": "33.023000"},
+        "format": {"duration": "33.023000", "format_name": _MKV},
     })
     assert meta.video_duration_seconds == pytest.approx(30.0)
 
@@ -110,7 +210,7 @@ def test_an_mp4_duration_is_a_length_and_is_left_alone():
     meta = parse_probe_metadata({
         "streams": [{"duration": "30.000000", "width": 320, "height": 240,
                      "r_frame_rate": "25/1", "start_time": "3.000000"}],
-        "format": {"duration": "33.000000"},
+        "format": {"duration": "33.000000", "format_name": _MOV},
     })
     assert meta.video_duration_seconds == pytest.approx(30.0)
 
@@ -123,43 +223,146 @@ def test_an_hour_long_duration_tag_is_read_as_hours():
     meta = parse_probe_metadata({
         "streams": [{"width": 1920, "height": 1080, "r_frame_rate": "25/1",
                      "tags": {"DURATION": "01:01:40.000000000"}}],
-        "format": {"duration": "3700.000000"},
+        "format": {"duration": "3700.000000", "format_name": _MKV},
     })
     assert meta.video_duration_seconds == pytest.approx(3700.0)
 
 
-def test_a_language_suffixed_duration_tag_still_counts():
-    # ffmpeg writes DURATION-eng when the track carries a language.
+def test_a_stale_language_suffixed_tag_does_not_win():
+    # mkvmerge v45 and earlier wrote `DURATION-eng`. It survives a `-c copy` cut
+    # into the new file, where it states the length of the file the cut came
+    # from -- and ffprobe emits it first, so reading whichever `DURATION*` key
+    # comes first lets a stale 120s beat the fresh 32s beside it. That refuses a
+    # correct 32s ladder at 27%.
     meta = parse_probe_metadata({
         "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
                      "tags": {"language": "eng",
-                              "DURATION-eng": "00:01:00.000000000"}}],
-        "format": {"duration": "90.000000"},
+                              "DURATION-eng": "00:02:00.000000000",
+                              "DURATION": "00:00:32.200000000"}}],
+        "format": {"duration": "32.200000", "format_name": _MKV},
     })
-    assert meta.video_duration_seconds == pytest.approx(60.0)
+    assert meta.video_duration_seconds == pytest.approx(32.2)
 
 
-def test_a_lowercase_duration_tag_still_counts():
-    # Tag keys come back uppercase from every muxer measured; this holds the
-    # case-folding that makes that an observation rather than an assumption.
+def test_a_suffixed_tag_on_its_own_is_not_read_at_all():
+    # And with no fresh tag beside it there is nothing to fall back to. Reading
+    # it anyway would be judging on a number from another file; declining leaves
+    # the file unjudged, which is the safe half of the asymmetry.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "tags": {"language": "eng",
+                              "DURATION-eng": "00:02:00.000000000"}}],
+        "format": {"duration": "32.200000", "format_name": _MKV},
+    })
+    assert meta.video_duration_seconds is None
+
+
+def test_a_lowercase_duration_key_is_not_the_tag():
+    # Matroska tag names are case-sensitive and every muxer measured writes
+    # `DURATION`; ffmpeg 7.1.5 writes it that way even for a track carrying a
+    # language. A lowercase key is therefore something else, and guessing that
+    # it means the same thing is guessing.
     meta = parse_probe_metadata({
         "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
                      "tags": {"duration": "00:01:00.000000000"}}],
-        "format": {"duration": "90.000000"},
+        "format": {"duration": "90.000000", "format_name": _MKV},
     })
-    assert meta.video_duration_seconds == pytest.approx(60.0)
+    assert meta.video_duration_seconds is None
+
+
+def test_a_tag_longer_than_the_container_is_capped_at_the_container():
+    # A Matroska cut out of a longer one and written to a pipe keeps the
+    # source's Segment Duration, because the muxer cannot seek back to correct
+    # it. Where the tag outruns the container, the tag is not about this file's
+    # packets, and the smaller number is the safe one: capping can only make the
+    # check more permissive, never more eager.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "tags": {"DURATION": "00:02:00.000000000"}}],
+        "format": {"duration": "32.000000", "format_name": _MKV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(32.0)
 
 
 def test_no_video_duration_anywhere_is_none_rather_than_the_container():
-    # A Matroska written to a pipe, which carries neither field nor tag. The
-    # container number is still wrong for this purpose, so the field stays
-    # empty; the transcode probes for the answer instead (below).
+    # A Matroska written to a pipe, which carries neither field nor tag: a live
+    # recorder, a browser capture. The container's number is still the wrong one
+    # for this purpose, so nothing is offered and the check stays inert.
     meta = parse_probe_metadata({
         "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1"}],
-        "format": {"duration": "90.000000"},
+        "format": {"duration": "90.000000", "format_name": _MKV},
     })
     assert meta.duration_seconds == pytest.approx(90.0)
     assert meta.video_duration_seconds is None
+
+
+def test_a_missing_format_name_declines_rather_than_assuming_mp4():
+    # ffprobe always reports one, so this is about what happens when the shape
+    # of the probe changes underneath: an absent family must not default into
+    # the one family that is trusted.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 1920, "height": 1080,
+                     "r_frame_rate": "25/1"}],
+        "format": {"duration": "600.000000"},
+    })
+    assert meta.duration_seconds == pytest.approx(600.0)
+    assert meta.video_duration_seconds is None
+
+
+@pytest.mark.parametrize("name", ["mov", "mp4", _MOV])
+def test_each_name_in_the_mov_family_counts_on_its_own(name):
+    # ffprobe emits the whole comma-joined family, so in practice the set is only
+    # ever pinned as "intersects that list" and dropping one member changes
+    # nothing. This pins the intent instead: each name means the mov/mp4 demuxer,
+    # and a probe reporting just one of them is not a different container.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 1920, "height": 1080,
+                     "r_frame_rate": "25/1"}],
+        "format": {"duration": "600.000000", "format_name": name},
+    })
+    assert meta.video_duration_seconds == pytest.approx(600.0)
+
+
+@pytest.mark.parametrize("fmt", [{}, {"format_name": "avi"},
+                                 {"format_name": "asf"}])
+def test_the_duration_tag_is_only_read_for_matroska(fmt):
+    # The other half of "an absent family must not default into a trusted one":
+    # it must not fall into the *tag* rule either. No accepted container besides
+    # Matroska publishes stream tags at all on ffmpeg 7.1.5 -- AVI, MPEG-PS and
+    # ASF publish none -- so this guards against a shape some other muxer writes,
+    # and it is the gate Ravi asked for by name.
+    probe = {
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "tags": {"DURATION": "00:02:00.000000000"}}],
+        "format": {"duration": "120.000000", **fmt},
+    }
+    assert parse_probe_metadata(probe).video_duration_seconds is None
+
+
+def test_a_duration_tag_with_no_container_duration_is_used_as_it_stands():
+    # The cap's other branch: nothing to cap against. A Matroska written without
+    # a segment duration still states its track's extent, and capping at a
+    # missing number -- treating it as zero -- would switch the check off there.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "tags": {"DURATION": "00:00:30.000000000"}}],
+        "format": {"format_name": _MKV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(30.0)
+
+
+def test_a_negative_start_time_does_not_inflate_the_tag():
+    # A Matroska can report a start before zero -- the corpus has one at
+    # -0.007s and a PTS-wrapped file at -3.7s. Subtracting a negative number
+    # *adds* to the tag's end timestamp, which refuses an intact file, so the
+    # offset is floored at zero.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "start_time": "-3.717689",
+                     "tags": {"DURATION": "00:00:30.000000000"}}],
+        "format": {"duration": "30.000000", "format_name": _MKV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(30.0)
 
 
 @pytest.mark.parametrize("tag, why", [
@@ -172,7 +375,7 @@ def test_an_unusable_duration_tag_is_ignored(tag, why):
     meta = parse_probe_metadata({
         "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
                      "tags": {"DURATION": tag}}],
-        "format": {"duration": "90.000000"},
+        "format": {"duration": "90.000000", "format_name": _MKV},
     })
     assert meta.video_duration_seconds is None, why
 
@@ -182,7 +385,7 @@ def test_a_tag_shorter_than_the_offset_is_ignored_rather_than_negative():
         "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
                      "start_time": "50.0",
                      "tags": {"DURATION": "00:00:30.000000000"}}],
-        "format": {"duration": "90.000000"},
+        "format": {"duration": "90.000000", "format_name": _MKV},
     })
     assert meta.video_duration_seconds is None
 
@@ -192,20 +395,134 @@ def test_an_unreadable_start_time_is_treated_as_zero():
         "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
                      "start_time": "N/A",
                      "tags": {"DURATION": "00:00:30.000000000"}}],
-        "format": {"duration": "90.000000"},
+        "format": {"duration": "90.000000", "format_name": _MKV},
     })
     assert meta.video_duration_seconds == pytest.approx(30.0)
 
 
-def test_a_stream_duration_is_preferred_over_a_tag():
-    # Both present: the field is authoritative, the tag is what a muxer wrote.
+def test_a_missing_stream_duration_in_an_mp4_declines():
+    # Honest about what this covers: the absent field, which reaches
+    # `video_track_seconds` as None and declines there. A field holding "N/A"
+    # does not reach it -- `duration_seconds` parses the same field two lines
+    # earlier and raises, exactly as it does on main -- so the ValueError half of
+    # that guard is unreachable today and is kept only because the two failure
+    # modes belong together.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1"}],
+        "format": {"duration": "90.000000", "format_name": _MOV},
+    })
+    assert meta.duration_seconds == pytest.approx(90.0)
+    assert meta.video_duration_seconds is None
+
+
+def test_a_matroska_stream_duration_is_ignored_in_favour_of_the_tag():
+    # The two rules do not overlap: Matroska publishes no per-stream duration,
+    # so a value appearing there came from somewhere unexpected and the tag,
+    # which is what ffmpeg actually writes, is what counts.
     meta = parse_probe_metadata({
         "streams": [{"duration": "600.000000", "width": 1920, "height": 1080,
                      "r_frame_rate": "25/1",
                      "tags": {"DURATION": "00:00:20.000000000"}}],
-        "format": {"duration": "600.000000"},
+        "format": {"duration": "600.000000", "format_name": _MKV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize("tag", ["00:00:inf", "inf:00:00", "00:00:nan"])
+def test_a_non_finite_duration_tag_is_ignored(tag):
+    # `inf` passes a `> 0` test and then refuses every ladder at 0% while the
+    # file is perfectly good -- the same trap `hls_output_seconds` already guards
+    # on `#EXTINF`, one function further down the same comparison.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "tags": {"DURATION": tag}}],
+        "format": {"duration": "90.000000", "format_name": _MKV},
+    })
+    assert meta.video_duration_seconds is None
+
+
+def test_a_non_finite_container_duration_does_not_become_the_cap():
+    # Documentation of the contract rather than cover: `min(tag, inf)` is the tag
+    # either way, so dropping `isfinite` from `_format_end_seconds` cannot be
+    # observed here and that mutation is equivalent. The guard stays because the
+    # function's answer is meant to be a real duration, not because a test
+    # catches its absence.
+    meta = parse_probe_metadata({
+        "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1",
+                     "tags": {"DURATION": "00:00:30.000000000"}}],
+        "format": {"duration": "inf", "format_name": _MKV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(30.0)
+
+
+def test_a_zero_disposition_written_as_a_string_is_still_zero():
+    # ffprobe writes the flag as an integer. Were it ever a string, treating
+    # every value as true would make every file decline -- the check switched off
+    # everywhere, which looks exactly like nothing happening.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 1920, "height": 1080,
+                     "r_frame_rate": "25/1",
+                     "disposition": {"attached_pic": "0"}}],
+        "format": {"duration": "600.000000", "format_name": _MOV},
     })
     assert meta.video_duration_seconds == pytest.approx(600.0)
+
+    cover = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 600, "height": 600,
+                     "r_frame_rate": "90000/1",
+                     "disposition": {"attached_pic": "1"}}],
+        "format": {"duration": "600.000000", "format_name": _MOV},
+    })
+    assert cover.video_duration_seconds is None
+
+
+@pytest.mark.parametrize("field", ["disposition", "tags"])
+def test_a_probe_whose_shape_moved_declines_rather_than_raising(field):
+    # `parse_probe_metadata` is also called by `get_video_metadata`, where an
+    # AttributeError would propagate. On main these inputs could not raise, and
+    # a new field must not make them able to.
+    # A non-empty list: an empty one is falsy, so `value or {}` would still
+    # yield a mapping and the guard would look held when it is not.
+    stream = {"width": 640, "height": 480, "r_frame_rate": "25/1",
+              field: [{"DURATION": "00:02:00.000000000"}]}
+    meta = parse_probe_metadata({
+        "streams": [stream],
+        "format": {"duration": "90.000000", "format_name": _MKV},
+    })
+    assert meta.duration_seconds == pytest.approx(90.0)
+    assert meta.video_duration_seconds is None
+
+
+def test_a_format_block_that_is_not_a_mapping_declines():
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "600.000000", "width": 640, "height": 480,
+                     "r_frame_rate": "25/1"}],
+        "format": [{"duration": "600.000000"}],
+    })
+    assert meta.duration_seconds == pytest.approx(600.0)
+    assert meta.video_duration_seconds is None
+
+
+def test_the_file_duration_is_unchanged_by_all_of_this():
+    # `duration_seconds` is what reaches the database, the player and the
+    # comment timecodes, and it must keep behaving exactly as it does on main:
+    # the stream's own figure where there is one, the format's otherwise --
+    # whatever the container, and whether or not the video track is judged.
+    for format_name in ("asf", "avi", "mpeg", _MOV, _MKV, None):
+        fmt = {"duration": "40.000000"}
+        if format_name:
+            fmt["format_name"] = format_name
+        with_stream = parse_probe_metadata({
+            "streams": [{"duration": "30.000000", "width": 640, "height": 480,
+                         "r_frame_rate": "25/1"}],
+            "format": fmt,
+        })
+        assert with_stream.duration_seconds == pytest.approx(30.0), format_name
+        without = parse_probe_metadata({
+            "streams": [{"width": 640, "height": 480, "r_frame_rate": "25/1"}],
+            "format": fmt,
+        })
+        assert without.duration_seconds == pytest.approx(40.0), format_name
 
 
 # ------------------------------------------------------- reading the playlist
@@ -295,7 +612,7 @@ def test_the_live_case_is_refused(tmp_path):
         refuse_a_truncated_result(tmp_path, 1877.709167, label="ffmpeg (copy)")
     message = str(exc.value)
     assert "5%" in message
-    assert "1877.7s" in message
+    assert "1877.7s video track" in message
     assert "ffmpeg (copy)" in message
 
 
@@ -399,8 +716,8 @@ def test_an_unknown_source_duration_cannot_be_judged(tmp_path):
 def _drive_a_transcode(
     tmp_path, written_seconds, source_seconds=600.0, *,
     copy_path=False, with_progress=True, video_stream=None, audio_stream=None,
-    format_duration=None, tail_packets=None, first_attempt_fails=False,
-    first_attempt_writes_first=False,
+    format_duration=None, format_name=_MOV, first_attempt_fails=False,
+    first_attempt_writes_first=False, final_attempt=False,
 ):
     """Run the real transcode with a mocked ffmpeg that writes a real playlist.
 
@@ -429,7 +746,10 @@ def _drive_a_transcode(
         "duration": f"{source_seconds:.6f}", "width": 1920, "height": 1080,
         "start_time": "0.000000",
     }
-    fmt = {"duration": f"{format_duration if format_duration is not None else source_seconds:.6f}"}
+    fmt = {
+        "duration": f"{format_duration if format_duration is not None else source_seconds:.6f}",
+        "format_name": format_name,
+    }
     audio = [audio_stream] if audio_stream else []
     commands: list[list[str]] = []
     attempts = {"hls": 0}
@@ -464,10 +784,6 @@ def _drive_a_transcode(
         """What a run of `cmd` produces, as (returncode, stdout, stderr)."""
         commands.append(cmd)
         if cmd[0] == "ffprobe":
-            # The tail probe asks about every stream at once, so it carries no
-            # -select_streams and must be matched before the selector below.
-            if "packet=pts_time,codec_type" in cmd:
-                return 0, json.dumps({"packets": tail_packets or []}), ""
             selected = (cmd[cmd.index("-select_streams") + 1]
                         if "-select_streams" in cmd else "")
             if selected != "v:0":
@@ -542,6 +858,7 @@ def _drive_a_transcode(
         media_id="m1", version_id="v1", input_s3_key="raw/in.mp4",
         output_s3_prefix="processed/m1/v1", qualities=["1080p"],
         progress_cb=(lambda _percent: None) if with_progress else None,
+        final_attempt=final_attempt,
     )
     env = {}
     if copy_path:
@@ -574,7 +891,7 @@ def test_the_check_is_wired_into_the_encode_path(tmp_path, with_progress):
     )
     assert result.success is False
     assert "16%" in result.error
-    assert "600.0s source" in result.error
+    assert "600.0s video track" in result.error
 
 
 @pytest.mark.parametrize("with_progress", [True, False])
@@ -658,7 +975,7 @@ def test_a_refused_copy_does_not_fall_back_to_the_encoder(tmp_path):
         copy_path=True,
     )
     assert result.success is False
-    assert "the read ended early" in result.error
+    assert _REFUSED in result.error
     assert len(_hls_commands(commands)) == 1, "the encoder must not have run"
 
 
@@ -669,7 +986,8 @@ def test_a_full_length_transcode_passes_the_check(tmp_path):
     result, _, _ = _drive_a_transcode(
         tmp_path, written_seconds=600.0, source_seconds=600.0,
     )
-    assert "the read ended early" not in (result.error or "")
+    assert _REFUSED not in (result.error or "")
+    assert result.success is True
 
 
 def test_a_matroska_with_an_audio_tail_is_not_refused_end_to_end(tmp_path):
@@ -678,10 +996,17 @@ def test_a_matroska_with_an_audio_tail_is_not_refused_end_to_end(tmp_path):
     # check the container's number refuses it at 67%, and because the mismatch
     # reproduces on every read the upload ends at `failed` and its master is
     # reaped a day later.
+    #
+    # `format_name` matters here and is the reason this test was once green for
+    # the wrong reason: without it the driver's mov/mp4 default was in force, the
+    # stream carries a tag and no `duration` field, so the whole check declined
+    # and the test passed on a file it never judged. It is the only end-to-end
+    # test that drives the Matroska branch, so it now says so out loud.
     result, _, _ = _drive_a_transcode(
         tmp_path,
         written_seconds=600.0,
         source_seconds=600.0,
+        format_name=_MKV,
         video_stream={
             "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
             "width": 1920, "height": 1080, "start_time": "0.000000",
@@ -690,82 +1015,205 @@ def test_a_matroska_with_an_audio_tail_is_not_refused_end_to_end(tmp_path):
         audio_stream={"codec_name": "aac", "duration": "900.000000"},
         format_duration=900.0,
     )
-    assert "the read ended early" not in (result.error or "")
+    assert _REFUSED not in (result.error or "")
+    assert result.success is True
 
 
-# A container that publishes no per-stream video duration -- FLV never does,
-# nor does a Matroska written to a pipe. All that is left is the container's
-# own duration, and one probe of the tail says what that number is about. The
-# three shapes below are taken from real files; the numbers are in
-# `_probe_expected_video_seconds`.
-_NO_VIDEO_DURATION = {
-    "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
-    "width": 1920, "height": 1080,
-}
-
-
-def test_a_source_that_falls_short_of_its_own_claim_is_refused(tmp_path):
-    # The truncated-FLV shape: the container says 600s, and nothing is readable
-    # anywhere near that -- the last packet of any stream is at 60s. The file
-    # was cut short, and 600s is still what it was supposed to hold.
-    #
-    # Measured before this existed: 10% of a 300s FLV master was accepted as
-    # complete, exit code 0 -- the original incident, through the new check.
-    result, _, commands = _drive_a_transcode(
-        tmp_path, written_seconds=60.0, source_seconds=600.0,
-        video_stream=_NO_VIDEO_DURATION,
-        tail_packets=[{"pts_time": "59.960", "codec_type": "video"},
-                      {"pts_time": "59.980", "codec_type": "audio"}],
+def test_a_matroska_whose_ladder_is_short_is_refused_end_to_end(tmp_path):
+    # The mirror, so the branch above is driven in both directions: the same
+    # 600s tag, a ladder of 98s. Without this, making the Matroska branch return
+    # None would leave every Matroska unjudged with the suite green.
+    result, _, _ = _drive_a_transcode(
+        tmp_path,
+        written_seconds=98.0,
+        source_seconds=600.0,
+        format_name=_MKV,
+        video_stream={
+            "codec_name": "h264", "pix_fmt": "yuv420p", "r_frame_rate": "25/1",
+            "width": 1920, "height": 1080, "start_time": "0.000000",
+            "tags": {"DURATION": "00:10:00.000000000"},
+        },
+        format_duration=900.0,
     )
-    assert any("packet=pts_time,codec_type" in c for c in commands)
     assert result.success is False
-    assert "10%" in result.error
-    assert "600.0s source" in result.error
+    assert "600.0s video track" in result.error
 
 
-def test_a_source_readable_to_its_claim_is_measured_not_assumed(tmp_path):
-    # The intact-FLV shape: readable right up to the claim, so the picture's
-    # own last packet is the length, and a complete ladder passes.
+def test_a_truncated_avi_is_stored_as_it_always_was(tmp_path):
+    # The cost of judging narrowly, stated rather than left to be discovered.
+    # AVI, MPEG-PS and WMV are three of the seven video types the product
+    # accepts, and for those this check is now permanently inert: a genuinely
+    # truncated one is stored `ready` with a short ladder, exactly as on main.
+    #
+    # That is the deliberate trade -- their per-stream duration is synthesised
+    # and judging on it refuses intact uploads -- and this test exists so the
+    # trade is visible in the suite instead of only in a comment.
+    result, s3, _ = _drive_a_transcode(
+        tmp_path, written_seconds=98.0, source_seconds=600.0,
+        format_name="avi",
+    )
+    assert result.success is True
+    assert s3.upload_file.call_count > 0
+
+
+# ------------------------------------------- the last attempt gives way
+#
+# The half of this feature that decides what a wrong answer costs. Refusing
+# forever spends the master; refusing once spends a minute.
+
+def test_the_last_attempt_stores_a_short_ladder_rather_than_failing(tmp_path,
+                                                                    capsys):
+    # The same file that is refused above, on the attempt after which there is
+    # no retry left. It has to come out stored: `failed` is what brings the
+    # reaper, and the reaper deletes the original -- which for every shape in
+    # the metadata section above is an intact upload.
     result, _, _ = _drive_a_transcode(
+        tmp_path, written_seconds=98.0, source_seconds=600.0,
+        final_attempt=True,
+    )
+    assert _REFUSED not in (result.error or "")
+    assert result.success is True
+    # Loud, and with both numbers, because the log line is now the only trace.
+    # Both numbers and the share, which is what Ravi asked the line to carry.
+    # Asserted as the three facts rather than as a sentence, so the wording can
+    # be improved without a red test.
+    logged = capsys.readouterr().out
+    assert "98.0s" in logged and "600.0s" in logged and "16%" in logged
+
+
+def test_the_last_attempt_still_uploads_what_it_kept(tmp_path):
+    # Accepting means accepting: the ladder reaches the bucket and the version
+    # becomes `ready`, rather than being dropped on the floor between the two
+    # behaviours.
+    result, s3, _ = _drive_a_transcode(
+        tmp_path, written_seconds=98.0, source_seconds=600.0,
+        final_attempt=True,
+    )
+    assert result.success is True
+    assert s3.upload_file.call_count > 0
+
+
+def test_an_earlier_attempt_refuses_so_the_source_is_read_again(tmp_path):
+    # The mirror of the two above, pinned in the same run so the pair cannot
+    # collapse into "always accept" or "always refuse" with the suite green.
+    refused, s3, _ = _drive_a_transcode(
+        tmp_path, written_seconds=98.0, source_seconds=600.0,
+        final_attempt=False,
+    )
+    assert _REFUSED in (refused.error or ""), "refused for the right reason"
+    assert s3.upload_file.call_count == 0
+    accepted, _, _ = _drive_a_transcode(
+        tmp_path, written_seconds=98.0, source_seconds=600.0,
+        final_attempt=True,
+    )
+    assert refused.success is False
+    assert accepted.success is True
+
+
+def test_the_last_attempt_says_nothing_about_a_full_length_ladder(tmp_path,
+                                                                  capsys):
+    # The log line belongs to the mismatch, not to the last attempt. A line on
+    # every final attempt would train whoever reads these logs to ignore it.
+    _drive_a_transcode(
         tmp_path, written_seconds=600.0, source_seconds=600.0,
-        video_stream=_NO_VIDEO_DURATION,
-        tail_packets=[{"pts_time": "599.960", "codec_type": "video"},
-                      {"pts_time": "599.980", "codec_type": "audio"}],
+        final_attempt=True,
     )
-    assert "the read ended early" not in (result.error or "")
+    assert "600.0s" not in capsys.readouterr().out
 
 
-def test_an_audio_tail_without_a_published_duration_is_not_a_truncation(tmp_path):
-    # The third shape, and the one that decides whether this probe is safe: the
-    # file is readable to its claimed 600s, but the picture stops at 300s
-    # because the audio runs on. The ladder is complete at 300s. Comparing
-    # against the claim would refuse it at 50%.
-    result, _, _ = _drive_a_transcode(
-        tmp_path, written_seconds=300.0, source_seconds=600.0,
-        video_stream=_NO_VIDEO_DURATION,
-        tail_packets=[{"pts_time": "299.960", "codec_type": "video"},
-                      {"pts_time": "599.980", "codec_type": "audio"}],
-    )
-    assert "the read ended early" not in (result.error or "")
+def test_a_failing_log_does_not_undo_the_acceptance(tmp_path):
+    # This branch exists so a mismatch cannot cost the master, so the branch must
+    # not be able to cost it either. A raising stdout -- a closed pipe, a manual
+    # run outside Celery's redirection -- would otherwise leave through both
+    # handlers in the attempt loop and fail the transcode on precisely the
+    # attempt that was added to keep it.
+    from unittest.mock import patch
+
+    _variant(tmp_path, "0", [2.0] * 49)
+    with patch("builtins.print", side_effect=BrokenPipeError("closed")):
+        refuse_a_truncated_result(tmp_path, 600.0, final_attempt=True)
 
 
-def test_a_window_with_no_picture_at_all_declines(tmp_path):
-    # Readable to the end, but the picture ended more than a probe window
-    # before it. Nothing here can say how long it ran, so nothing is claimed.
-    result, _, _ = _drive_a_transcode(
-        tmp_path, written_seconds=60.0, source_seconds=600.0,
-        video_stream=_NO_VIDEO_DURATION,
-        tail_packets=[{"pts_time": "599.980", "codec_type": "audio"}],
-    )
-    assert "the read ended early" not in (result.error or "")
+def test_the_default_is_to_refuse(tmp_path):
+    # A caller that does not say -- another backend, a script, a test -- gets
+    # the refusing behaviour, so forgetting to pass the flag cannot silently
+    # switch the whole check off.
+    from packages.transcoder.base import TranscodeJob
+
+    assert TranscodeJob(
+        media_id="m", version_id="v", input_s3_key="k", output_s3_prefix="p",
+    ).final_attempt is False
+
+    _variant(tmp_path, "0", [2.0] * 49)
+    with pytest.raises(TranscodeTruncated):
+        refuse_a_truncated_result(tmp_path, 600.0)
+
+    # And the same at the task's own seam, where the only caller always passes
+    # it: a default of True there would switch the check off for anything that
+    # calls `_process_video` without saying.
+    import inspect
+
+    from apps.api.tasks import transcode_tasks
+
+    assert inspect.signature(
+        transcode_tasks._process_video
+    ).parameters["final_attempt"].default is False
 
 
-def test_a_probe_that_says_nothing_declines_instead_of_failing(tmp_path):
-    # An undecidable file -- a piped Matroska has no container duration to aim
-    # the window at either. The transcode proceeds; it must not be failed for
-    # the absence of a number.
-    result, _, _ = _drive_a_transcode(
-        tmp_path, written_seconds=60.0, source_seconds=600.0,
-        video_stream=_NO_VIDEO_DURATION, format_duration=0.0, tail_packets=[],
-    )
-    assert "the read ended early" not in (result.error or "")
+def test_the_task_passes_its_own_retry_count_down():
+    # Celery's retry state lives on the task and is read after the transcode has
+    # returned (`self.request.retries >= self.max_retries`), so the transcoder
+    # cannot ask for it and has to be told beforehand.
+    #
+    # Driven through the real task with a pushed request, and reading the flag
+    # off the job the real `_process_video` built -- not off a stand-in for
+    # either. That span is the point: an earlier version of this test patched
+    # `_process_video` out and stopped one call short of the job, while the
+    # wiring tests above construct their own job and start one step past it.
+    # Deleting `final_attempt=final_attempt` from the `TranscodeJob(...)` call
+    # then left every one of them green while restoring the whole defect.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from apps.api.models.asset import AssetType
+    from apps.api.tasks import transcode_tasks
+    from packages.transcoder.base import TranscodeResult
+
+    # Derived from the task rather than from the literal 3, so raising the retry
+    # budget is a tuning change and not a red test.
+    ceiling = transcode_tasks.process_asset.max_retries
+
+    def _flag_after(retries: int) -> bool:
+        # One stand-in answers the version, asset and media-file lookups alike,
+        # so it carries what all three are read for.
+        row = SimpleNamespace(id="asset-1", project_id="proj-1",
+                              asset_type=AssetType.video,
+                              s3_key_raw="raw/in.mp4", s3_key_processed=None,
+                              s3_key_download=None, s3_key_thumbnail=None,
+                              processing_status=None, duration_seconds=None,
+                              width=None, height=None, fps=None)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = row
+        result = TranscodeResult(success=True, hls_prefix="processed/x",
+                                 duration_seconds=6.0, width=16, height=16,
+                                 fps=25.0)
+        with patch("packages.transcoder.ffmpeg_transcoder.FFmpegTranscoder") as cls, \
+                patch.object(transcode_tasks, "_run_async",
+                             MagicMock(return_value=result)), \
+                patch.object(transcode_tasks, "SessionLocal", return_value=db), \
+                patch.object(transcode_tasks, "get_s3_client", MagicMock()), \
+                patch.object(transcode_tasks, "_publish_event", MagicMock()):
+            cls.return_value.transcode.return_value = None
+            transcode_tasks.process_asset.push_request(retries=retries)
+            try:
+                transcode_tasks.process_asset.run(
+                    "0f9ad1d6-0000-4000-8000-000000000001",
+                    "0f9ad1d6-0000-4000-8000-000000000002",
+                )
+            finally:
+                transcode_tasks.process_asset.pop_request()
+        return cls.return_value.transcode.call_args[0][0].final_attempt
+
+    for retries, expected in ((0, False), (ceiling - 1, False),
+                              (ceiling, True), (ceiling + 1, True)):
+        assert _flag_after(retries) is expected, f"retries={retries}"

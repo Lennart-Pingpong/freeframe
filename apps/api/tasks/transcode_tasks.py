@@ -57,9 +57,21 @@ def process_asset(self, asset_id: str, version_id: str):
         output_prefix = f"processed/{asset.project_id}/{asset_id}/{version_id}"
         s3 = get_s3_client()
 
+        # Whether this read of the source is the last one there will be. The
+        # same `retries >= max_retries` decides `failed` in the handler below --
+        # but that happens after the transcode has already returned, and the
+        # transcoder needs to know beforehand: a check that cannot be certain has
+        # to give way on the last attempt rather than spend the master. Deriving
+        # both from one expression is deliberate, so they cannot drift apart.
+        # See TranscodeJob.
+        final_attempt = self.request.retries >= self.max_retries
+
         try:
             if asset.asset_type in (AssetType.video,):
-                _process_video(db, asset, version, media_file, s3, output_prefix)
+                _process_video(
+                    db, asset, version, media_file, s3, output_prefix,
+                    final_attempt=final_attempt,
+                )
             elif asset.asset_type == AssetType.audio:
                 _process_audio(db, asset, version, media_file, s3, output_prefix)
             elif asset.asset_type in (AssetType.image, AssetType.image_carousel):
@@ -112,7 +124,10 @@ def process_asset(self, asset_id: str, version_id: str):
         db.close()
 
 
-def _process_video(db, asset, version, media_file, s3, output_prefix):
+def _process_video(
+    db, asset, version, media_file, s3, output_prefix, *,
+    final_attempt: bool = False,
+):
     from packages.transcoder.ffmpeg_transcoder import FFmpegTranscoder, parse_qualities
     from packages.transcoder.base import TranscodeJob
 
@@ -146,6 +161,7 @@ def _process_video(db, asset, version, media_file, s3, output_prefix):
         output_s3_prefix=output_prefix,
         qualities=parse_qualities(settings.transcoder_qualities),
         progress_cb=_on_progress,
+        final_attempt=final_attempt,
     )
     result = _run_async(transcoder.transcode(job))
 
