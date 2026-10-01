@@ -170,7 +170,7 @@ function PasswordGate({ onSubmit, error, loading }: PasswordGateProps) {
             onChange={(e) => setPassword(e.target.value)}
             placeholder="Enter password…"
             autoFocus
-            className="flex h-9 w-full rounded-md border border-border bg-bg-tertiary px-3 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-focus"
+            className="flex h-9 w-full rounded-md border border-border bg-bg-tertiary px-3 text-[16px] [@media(hover:hover)]:text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-focus"
           />
           {error && <p className="text-xs text-status-error">{error}</p>}
           <Button type="submit" size="sm" className="w-full" loading={loading}>

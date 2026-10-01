@@ -133,6 +133,46 @@ If FreeFrame sits behind another proxy that already handles SSL:
 4. For **Cloudflare**: set SSL mode to "Full"
 5. Set `FRONTEND_URL` in `.env.prod` to your `https://` URL
 
+### Sub-path Deployments
+
+To serve FreeFrame under a path instead of the domain root — `https://example.com/freeframe/` — set the base path and rebuild the web image:
+
+```
+NEXT_PUBLIC_BASE_PATH=/freeframe
+FRONTEND_URL=https://example.com/freeframe
+```
+
+`NEXT_PUBLIC_BASE_PATH` is a **build-time** variable for the Docker image (Compose passes it as a build arg), so changing it needs `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build web`, not a restart. (`next dev` in the dev stack reads it when the server starts.) Everything the web app serves moves under the prefix: pages, links, static assets, icons and raw navigations. The API stays at the origin root (`/api`), and links built from `FRONTEND_URL` carry the path, so invite and share emails keep pointing inside the mounted app. CORS matches the bare origin, since a browser's `Origin` header never carries a path.
+
+If something sits in front of FreeFrame (a landing page, another app), forward the sub-path to FreeFrame **unchanged** — Next expects the prefix — and forward the API at the origin root as well, because that is where the browser still calls it, including the request bodies it sends. With nginx that is three `proxy_pass` locations, none with a URI part:
+
+```nginx
+# Two locations for the sub-path, not one. With trailingSlash unset, Next
+# answers /freeframe/ with a 308 to /freeframe, and a lone "location /freeframe/"
+# answers /freeframe with nginx's own 301 back, so the two would bounce forever.
+# The exact match takes /freeframe itself before that 301 can happen. The
+# slash-terminated prefix takes everything under it without also swallowing
+# siblings such as /freeframe-docs or /freeframe.html, which a bare
+# "location /freeframe" would send to FreeFrame's 404.
+location = /freeframe {
+    proxy_pass http://127.0.0.1:80;
+}
+
+location /freeframe/ {
+    proxy_pass http://127.0.0.1:80;
+}
+
+location /api/ {
+    # Project posters are the only large bodies the browser sends to the API.
+    # The API accepts 10 MB; nginx's 1 MB default would reject them with an
+    # HTML 413 the frontend cannot parse.
+    client_max_body_size 10m;
+    proxy_pass http://127.0.0.1:80;
+}
+```
+
+Traefik in the bundled Compose already routes the sub-path to the web app and `/api` to the API, so forwarding both to FreeFrame's port 80 is enough; only a proxy that terminates the sub-path itself has to name the API separately. Leave `NEXT_PUBLIC_BASE_PATH` empty for a root deployment (the default).
+
 ---
 
 ## Bring Your Own Infrastructure
@@ -169,7 +209,7 @@ Works with: **AWS ElastiCache, Upstash, Redis Cloud, DigitalOcean Managed Redis,
 
 Works with: **AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, or any S3-compatible service.**
 
-There's no S3 service in the production compose — you always provide your own. Configure in `.env.prod`:
+The production compose runs no S3 service by default — you provide your own. (`docker-compose.prod.yml` ships a commented-out MinIO block if you want to keep media on the same host; see the notes above it.) Configure in `.env.prod`:
 
 ```
 S3_STORAGE=s3
@@ -178,6 +218,8 @@ S3_ACCESS_KEY=YOUR_ACCESS_KEY
 S3_SECRET_KEY=YOUR_SECRET_KEY
 S3_REGION=us-east-1
 ```
+
+`S3_BUCKET` must be a valid S3 bucket name: 3-63 characters, lowercase letters, digits, hyphens and dots only. Underscores and capitals are rejected.
 
 For **non-AWS S3-compatible providers** (R2, B2, Spaces, MinIO, Hetzner, …), set `S3_STORAGE` to a non-`s3` value (e.g. `minio`) so `S3_ENDPOINT` is used — with `S3_STORAGE=s3` the client talks to native AWS and the endpoint is **ignored** (FreeFrame refuses to start if `s3` is combined with a non-AWS endpoint). Then set the endpoint:
 
