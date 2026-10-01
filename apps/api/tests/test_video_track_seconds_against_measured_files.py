@@ -14,8 +14,8 @@ The assertion is the one that matters, and it is the same for all of them:
     tolerance of the picture's real length.
 
 Both halves have teeth. Answering with a number that is too large refuses an
-intact upload on every read, which ends the version at `failed` and has the
-reaper delete the master. Answering None costs the check on that container, and
+intact upload on every read but the last, which costs three full encodes before
+the final attempt stores it. Answering None costs the check on that container, and
 the set of containers that are judged is asserted below so that a change which
 quietly switches everything off is a red test rather than a silent retreat.
 """
@@ -60,7 +60,9 @@ MEASURED = [
   # an end timestamp, so the start offset has to come off
     ('mkv-bild-startet-spaet.mkv', 30.0, False, {'streams': [{'start_time': '3.000000', 'tags': {'DURATION': '00:00:33.000000000'}}], 'format': {'duration': '33.008000', 'format_name': 'matroska,webm'}}),
   # the mov counterpart, where the per-stream duration is a length already and no correction applies
-    ('mp4-bild-startet-spaet.mp4', 30.0, False, {'streams': [{'duration': '30.000000', 'start_time': '3.000000', 'tags': {'language': 'und'}}], 'format': {'duration': '33.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
+  # (`nb_frames` added afterwards from the same `-itsoffset 3` construction measured on ffmpeg 7.1.1,
+  #  which reports start 3.000000, duration 30.000000, format 33.000000 and 750 frames, as here)
+    ('mp4-bild-startet-spaet.mp4', 30.0, False, {'streams': [{'duration': '30.000000', 'start_time': '3.000000', 'nb_frames': '750', 'tags': {'language': 'und'}}], 'format': {'duration': '33.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
   # two video tracks of different lengths; the ladder encodes v:0 only
     ('mkv-zwei-bildspuren.mkv', 20.0, False, {'streams': [{'start_time': '0.000000', 'tags': {'DURATION': '00:00:20.000000000'}}], 'format': {'duration': '40.000000', 'format_name': 'matroska,webm'}}),
     ('heil.mp4', 60.0, False, {'streams': [{'duration': '60.000000', 'start_time': '0.000000', 'tags': {'language': 'und'}}], 'format': {'duration': '60.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
@@ -72,7 +74,7 @@ MEASURED = [
     ('heil.wmv', 60.0, False, {'streams': [{'duration': '60.046000', 'start_time': '0.046000'}], 'format': {'duration': '60.092000', 'format_name': 'asf'}}),
   # an edit list trimming the start
     ('editlist-beschnitten.mp4', 55.0, False, {'streams': [{'duration': '55.000000', 'start_time': '0.000000', 'tags': {'language': 'und'}}], 'format': {'duration': '55.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
-    ('bild-startet-spaet.mp4', 30.0, False, {'streams': [{'duration': '30.000000', 'start_time': '3.000000', 'tags': {'language': 'und'}}], 'format': {'duration': '33.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
+    ('bild-startet-spaet.mp4', 30.0, False, {'streams': [{'duration': '30.000000', 'start_time': '3.000000', 'nb_frames': '750', 'tags': {'language': 'und'}}], 'format': {'duration': '33.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
   # the last frame held to the end of the file
     ('letztes-bild-gehalten.mp4', 30.0, False, {'streams': [{'duration': '30.000000', 'start_time': '0.000000', 'tags': {'language': 'und'}}], 'format': {'duration': '30.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
     ('bframes-open-gop.mp4', 60.0, False, {'streams': [{'duration': '60.000000', 'start_time': '0.000000', 'tags': {'language': 'und'}}], 'format': {'duration': '60.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
@@ -92,6 +94,17 @@ MEASURED = [
     ('webm-von-ffmpeg.webm', 60.0, False, {'streams': [{'start_time': '0.000000', 'tags': {'DURATION': '00:01:00.000000000'}}], 'format': {'duration': '60.008000', 'format_name': 'matroska,webm'}}),
   # no video stream at all
     ('nur-ton-im-videocontainer.mp4', None, False, {'streams': [], 'format': {'duration': '60.000000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
+  # Fragmented MP4, where `stream.duration` is an end timestamp rather than a
+  # length and `nb_frames` is absent because the sample table in `moov` is empty.
+  # Measured with Homebrew's ffmpeg 7.1.1 on an HLS-fMP4 rendition of a 60s
+  # 30fps stream (`-hls_segment_type fmp4 -hls_time 4`), the init segment joined
+  # to: every segment; segments 6-15, as a live window or a partial download
+  # would leave it; segments 2-15. And `-movflags frag_keyframe+empty_moov`
+  # output of a 30s 25fps file. Real lengths are the counted packets.
+    ('fmp4-alle-segmente.mp4', 60.0, False, {'streams': [{'duration': '60.000000', 'start_time': '0.066016'}], 'format': {'duration': '60.023023', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
+    ('fmp4-ab-segment-6.mp4', 40.0, False, {'streams': [{'duration': '60.000000', 'start_time': '20.066016'}], 'format': {'duration': '60.053862', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
+    ('fmp4-ab-segment-2.mp4', 56.0, False, {'streams': [{'duration': '60.000000', 'start_time': '4.066016'}], 'format': {'duration': '60.052411', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
+    ('fmp4-empty-moov.mp4', 30.0, False, {'streams': [{'duration': '30.000000', 'start_time': '0.080000'}], 'format': {'duration': '33.080000', 'format_name': 'mov,mp4,m4a,3gp,3g2,mj2'}}),
 ]
 
 # The files whose picture length this code is willing to state. Pinned as a set
@@ -129,6 +142,10 @@ JUDGED = {
     'mkv-von-ffmpeg.mkv',
     'mkv-von-ffmpeg-sprache.mkv',
     'webm-von-ffmpeg.webm',
+    'fmp4-alle-segmente.mp4',
+    'fmp4-ab-segment-6.mp4',
+    'fmp4-ab-segment-2.mp4',
+    'fmp4-empty-moov.mp4',
 }
 
 

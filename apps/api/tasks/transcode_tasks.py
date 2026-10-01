@@ -58,12 +58,11 @@ def process_asset(self, asset_id: str, version_id: str):
         s3 = get_s3_client()
 
         # Whether this read of the source is the last one there will be. The
-        # same `retries >= max_retries` decides `failed` in the handler below --
-        # but that happens after the transcode has already returned, and the
-        # transcoder needs to know beforehand: a check that cannot be certain has
-        # to give way on the last attempt rather than spend the master. Deriving
-        # both from one expression is deliberate, so they cannot drift apart.
-        # See TranscodeJob.
+        # handler below reads this same flag to decide `failed` -- but that
+        # happens after the transcode has already returned, and the transcoder
+        # needs to know beforehand: a check that cannot be certain has to give
+        # way on the last attempt rather than spend the master. One flag for
+        # both is deliberate, so they cannot drift apart. See TranscodeJob.
         final_attempt = self.request.retries >= self.max_retries
 
         try:
@@ -101,7 +100,7 @@ def process_asset(self, asset_id: str, version_id: str):
             # a minute apart) while its raw object sat there intact, so
             # /upload/complete's retry guard, the reaper and the client each got
             # a different answer depending on when they asked.
-            if self.request.retries >= self.max_retries:
+            if final_attempt:
                 _record_failure()
                 raise
 

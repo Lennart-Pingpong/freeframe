@@ -206,13 +206,58 @@ def test_an_mp4_duration_is_a_length_and_is_left_alone():
     # The mirror, and the reason the subtraction cannot simply be applied
     # everywhere: MP4's per-stream duration is a track length already.
     # Measured on the same `-itsoffset 3` source written as mp4: start_time
-    # 3.000000 alongside duration 30.000000.
+    # 3.000000 alongside duration 30.000000, and the 750 frames of its sample
+    # table, which is what marks it as not fragmented.
     meta = parse_probe_metadata({
         "streams": [{"duration": "30.000000", "width": 320, "height": 240,
-                     "r_frame_rate": "25/1", "start_time": "3.000000"}],
+                     "r_frame_rate": "25/1", "start_time": "3.000000",
+                     "nb_frames": "750"}],
         "format": {"duration": "33.000000", "format_name": _MOV},
     })
     assert meta.video_duration_seconds == pytest.approx(30.0)
+
+
+def test_a_fragmented_mp4_duration_is_an_end_timestamp_and_the_offset_comes_off():
+    # The exception to the rule above. A fragmented file keeps its samples in
+    # the fragments, so `moov` has no sample table and ffprobe reports no
+    # `nb_frames`, and the demuxer's duration runs to the end of the last
+    # fragment from zero, not from the first `tfdt`. Measured on an HLS-fMP4
+    # init segment joined to media segments 6-15 of a 60s stream: 1200 frames
+    # at 30fps, 40s of picture. Read as a length, a complete ladder is refused
+    # at 67% on every attempt but the last.
+    meta = parse_probe_metadata({
+        "streams": [{"duration": "60.000000", "width": 320, "height": 240,
+                     "r_frame_rate": "30/1", "start_time": "20.066016"}],
+        "format": {"duration": "60.053862", "format_name": _MOV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(39.934, abs=0.001)
+
+
+@pytest.mark.parametrize("duration", ["inf", "nan"])
+def test_a_non_finite_mp4_duration_is_not_a_length(duration):
+    # The Matroska tag and the playlist sum both guard this; the mov branch has
+    # to as well, or `inf` would refuse every attempt but the last at 0%. (`nan`
+    # is already refused by `> 0`; it is here so that stays true.)
+    meta = parse_probe_metadata({
+        "streams": [{"duration": duration, "width": 320, "height": 240,
+                     "r_frame_rate": "25/1", "start_time": "0.000000",
+                     "nb_frames": "750"}],
+        "format": {"duration": "30.000000", "format_name": _MOV},
+    })
+    assert meta.video_duration_seconds is None
+
+
+@pytest.mark.parametrize("nb_frames", ["0", "N/A", None])
+def test_no_usable_frame_count_is_read_as_fragmented(nb_frames):
+    stream = {"duration": "60.000000", "width": 320, "height": 240,
+              "r_frame_rate": "30/1", "start_time": "20.0"}
+    if nb_frames is not None:
+        stream["nb_frames"] = nb_frames
+    meta = parse_probe_metadata({
+        "streams": [stream],
+        "format": {"duration": "60.0", "format_name": _MOV},
+    })
+    assert meta.video_duration_seconds == pytest.approx(40.0)
 
 
 def test_an_hour_long_duration_tag_is_read_as_hours():
@@ -239,7 +284,11 @@ def test_a_stale_language_suffixed_tag_does_not_win():
                      "tags": {"language": "eng",
                               "DURATION-eng": "00:02:00.000000000",
                               "DURATION": "00:00:32.200000000"}}],
-        "format": {"duration": "32.200000", "format_name": _MKV},
+        # The container's duration is stale as well, as it is on a cut that
+        # could not rewrite its header. With a fresh one here the cap at
+        # `format.duration` would trim the stale tag to 32.2 on its own, and
+        # this test would pass whichever key were read.
+        "format": {"duration": "120.008000", "format_name": _MKV},
     })
     assert meta.video_duration_seconds == pytest.approx(32.2)
 

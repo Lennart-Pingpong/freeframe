@@ -136,6 +136,24 @@ def _tag_end_seconds(stream: dict) -> Optional[float]:
     return total if total > 0 else None
 
 
+def _has_sample_table(stream: dict) -> bool:
+    """Whether the mov demuxer found this track's samples in `moov`.
+
+    ffprobe reports `nb_frames` from the sample table in `moov`, so the field is
+    absent for an fMP4 whose `moov` holds no samples and present on an ordinary
+    file. (A fragmented file written without `empty_moov` keeps its first
+    fragment's samples in `moov` and reports a partial count; it is read as
+    unfragmented, and ffmpeg starts those at zero, where the two readings agree.)
+    Measured with ffmpeg 7.1: `-movflags frag_keyframe+empty_moov` output and
+    joined HLS-fMP4 segments carry no `nb_frames`; plain, faststart and
+    `-itsoffset` files all carry their frame count.
+    """
+    try:
+        return int(stream.get("nb_frames")) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def video_track_seconds(data: dict, stream: dict) -> Optional[float]:
     """How long the picture runs, but only where the file really says so.
 
@@ -155,7 +173,18 @@ def video_track_seconds(data: dict, stream: dict) -> Optional[float]:
             seconds = float(stream.get("duration"))
         except (TypeError, ValueError):
             return None
-        return seconds if seconds > 0 else None
+        if not _has_sample_table(stream):
+            # Except in a fragmented file, where it is an end timestamp. The
+            # samples live in the fragments rather than in `moov`, and the
+            # demuxer takes the duration from the end of the last fragment
+            # without subtracting the first `tfdt`. Measured on an fMP4 init
+            # segment joined to media segments 6-15 of a 60s stream (a live
+            # window, a partial download): start_time 20.066, duration 60.000,
+            # 1200 frames at 30fps, which is 40s of picture. Read as a length,
+            # that refuses a complete ladder at 67% on every attempt but the last. A
+            # fragmented file that starts at zero is unaffected either way.
+            seconds -= _stream_start_seconds(stream)
+        return seconds if seconds > 0 and math.isfinite(seconds) else None
     if formats & _MATROSKA_FORMATS:
         tag_end = _tag_end_seconds(stream)
         if tag_end is None:
@@ -1907,6 +1936,12 @@ class FFmpegTranscoder(BaseTranscoder):
                 # Timeout scales with expected duration - 4 hours for very large files
                 return ffmpeg_cmd
 
+            # What the ladder will be held against. The video track's length,
+            # never the file's -- see refuse_a_truncated_result -- and None
+            # wherever the container does not state it, which leaves the check
+            # inert rather than guessing.
+            source_video_seconds = meta.video_duration_seconds
+
             # Try hardware first, then degrade to the software pipeline if the
             # device is unusable at runtime (most commonly another process on the
             # box has exhausted VRAM, so CUDA decode init fails with
@@ -1920,12 +1955,6 @@ class FFmpegTranscoder(BaseTranscoder):
             # remux drops to the encoder rather than failing the asset, and
             # unlike the hardware case any error is reason enough: a remux has
             # no environmental failures to tell apart from input ones.
-            # What the ladder will be held against. The video track's length,
-            # never the file's -- see refuse_a_truncated_result -- and None
-            # wherever the container does not state it, which leaves the check
-            # inert rather than guessing.
-            source_video_seconds = meta.video_duration_seconds
-
             attempts = [primary_backend]
             if primary_backend == "copy":
                 attempts.append(get_backend())
@@ -1963,8 +1992,14 @@ class FFmpegTranscoder(BaseTranscoder):
                     # useful move is to read the source again: the task retries
                     # in a minute, and the next read is a fresh connection to an
                     # object the store has certainly finished assembling.
-                    # Degrading to the encoder would re-read the same input the
-                    # same way and cost hours doing it.
+                    # Degrading to the encoder would re-read the same bytes and,
+                    # for a source that really is short, cost hours to come out
+                    # short again. Not always identically: a remux drops the
+                    # packets ahead of the first keyframe and an encode does
+                    # not, so a source that opens on non-keyframes can be
+                    # refused here when the encoder would have matched. That
+                    # costs the remux retries, and the final attempt then
+                    # stores the remux's ladder.
                     raise
                 except RuntimeError as exc:
                     is_last = attempt_index == len(attempts) - 1
