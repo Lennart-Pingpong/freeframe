@@ -999,7 +999,24 @@ def guest_comment(
     asset = _get_asset(db, target_asset_id)
     validate_asset_in_share(db, link, asset)
 
-    # Resolve version_id: use provided or get latest ready version
+    # A reply must answer a comment a guest on this link can actually see: a live,
+    # non-internal comment on the asset the link resolved to (`asset.id`, never
+    # `body.asset_id`). `parent_id` used to be written straight through, so an
+    # unknown id hit the foreign key and answered 500, and a parent on another
+    # asset or behind `internal` was accepted. Mirrors `create_comment` and
+    # `reply_to_comment`, including the version: a reply belongs to the same
+    # version as what it answers.
+    parent = None
+    if body.parent_id:
+        parent = db.query(Comment).filter(
+            Comment.id == body.parent_id,
+            Comment.asset_id == asset.id,
+            Comment.deleted_at.is_(None),
+            Comment.visibility != "internal",
+        ).first()
+        if not parent:
+            raise HTTPException(status_code=400, detail="Parent comment not found on this asset")
+
     version_id = body.version_id
     # A supplied version has to belong to the asset the link resolved, not merely
     # exist. Without the check the id was written straight through, and the export
@@ -1012,7 +1029,11 @@ def guest_comment(
         ).first()
         if not owned:
             raise HTTPException(status_code=400, detail="version_id does not belong to this asset")
-    else:
+
+    # Resolve version_id: the parent's for a reply, else provided, else the latest ready version
+    if parent:
+        version_id = parent.version_id
+    elif not version_id:
         latest = db.query(AssetVersion).filter(
             AssetVersion.asset_id == asset.id,
             AssetVersion.deleted_at.is_(None),
@@ -1051,7 +1072,7 @@ def guest_comment(
     comment = Comment(
         asset_id=asset.id,
         version_id=version_id,
-        parent_id=body.parent_id,
+        parent_id=parent.id if parent else None,
         author_id=author_id,
         guest_author_id=guest_author_id,
         timecode_start=body.timecode_start,
