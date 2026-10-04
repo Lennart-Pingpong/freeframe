@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A 2160p rung for the quality ladder.** `TRANSCODER_QUALITIES` now accepts `2160p` (3840x2160). It is opt-in, so the default ladder is unchanged. Set on its own, it gives one rendition at the source's own size for anything up to 4K, because a rung above the source is built at the source's size instead of being dropped: a 720p master comes out at 720p, a 1440p one at 1440p, and a 6K one is fitted into 3840x2160. With `TRANSCODER_SOURCE_COPY=true`, an H.264 8-bit master at any of those sizes is packaged without re-encoding. A 4K encode costs about four times the CPU of a 1080p one, so on an instance that receives HEVC, 10-bit or ProRes 4K masters a GPU backend is recommended. (#451)
+
 ### Fixed
 
 - **Comment replies only notify the parent author while they still have access to the asset.** Both signed-in and share-link reply paths apply the same access check, preventing stale threads from exposing asset names and reply previews after access is revoked. (#454, #456 by @sb123sb123)
