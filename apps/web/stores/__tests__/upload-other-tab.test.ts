@@ -32,6 +32,7 @@ vi.mock('@/lib/api', () => ({
 import { api } from '@/lib/api'
 import { useUploadStore, currentTabId, LIVE_WINDOW_MS } from '../upload-store'
 import type { UploadFile } from '../upload-store'
+import { installXhrFake, ok, type PartHandler } from '@/test/xhr-fake'
 
 const MB = 1024 * 1024
 const VERSION_ID = 'version-1'
@@ -180,10 +181,13 @@ describe('a row sent from elsewhere, while this tab watches', () => {
 // ---------------------------------------------------------- refusing to touch it
 
 describe('discarding or resuming an upload that is still moving somewhere else', () => {
+  let put = vi.fn<PartHandler>()
+
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(api.post).mockResolvedValue({} as never)
-    global.fetch = vi.fn().mockResolvedValue({ ok: true, headers: { get: () => '"e"' } }) as never
+    put = vi.fn<PartHandler>(() => ok('"e"'))
+    installXhrFake(put)
   })
 
   it('does not discard a row this tab did not start when the server saw it move just now', async () => {
@@ -258,7 +262,7 @@ describe('discarding or resuming an upload that is still moving somewhere else',
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('elsewhere'))
 
     expect(api.post).not.toHaveBeenCalledWith('/upload/presign-part', expect.anything())
-    expect(global.fetch).not.toHaveBeenCalled()
+    expect(put).not.toHaveBeenCalled()
   })
 })
 
@@ -348,7 +352,7 @@ describe('a tab that is sending', () => {
       }
       return new Promise(() => {}) as never // completion never answers
     })
-    global.fetch = vi.fn().mockResolvedValue({ ok: true, headers: { get: () => '"e"' } }) as never
+    installXhrFake(() => ok('"e"'))
 
     const id = useUploadStore.getState().startUpload(
       new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
@@ -378,6 +382,8 @@ describe('a tab that is sending', () => {
 // ---------------------------------------------------------- cancel
 
 describe('cancelling an upload', () => {
+  let put = vi.fn<PartHandler>()
+
   beforeEach(() => {
     vi.clearAllMocks()
     useUploadStore.setState({ files: [], versionsRevision: 0 })
@@ -394,10 +400,8 @@ describe('cancelling an upload', () => {
       return Promise.resolve({}) as never
     })
     // A part that only ends when it is aborted.
-    global.fetch = vi.fn((_: string, init?: RequestInit) => new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener('abort', () =>
-        reject(new DOMException('Aborted', 'AbortError')))
-    })) as never
+    put = vi.fn<PartHandler>(() => new Promise(() => {}))
+    installXhrFake(put)
   })
 
   it('throws the upload away rather than recording a failure, and tells the version list', async () => {
@@ -407,7 +411,7 @@ describe('cancelling an upload', () => {
     const id = useUploadStore.getState().startUpload(
       new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
     )
-    await vi.waitFor(() => expect(global.fetch).toHaveBeenCalled())
+    await vi.waitFor(() => expect(put).toHaveBeenCalled())
 
     useUploadStore.getState().cancelUpload(id)
 

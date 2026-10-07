@@ -18,6 +18,7 @@ vi.mock('@/lib/api', () => ({
 
 import { api } from '@/lib/api'
 import { useUploadStore } from '../upload-store'
+import { installXhrFake, ok } from '@/test/xhr-fake'
 
 const ASSET_ID = 'asset-1'
 const VERSION_ID = 'version-2'
@@ -78,10 +79,7 @@ describe('an upload whose completion request threw', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useUploadStore.setState({ files: [] })
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      headers: { get: () => '"etag-1"' },
-    }) as never
+    installXhrFake(() => ok('"etag-1"'))
   })
 
   it('is not reported as failed when the version already moved on', async () => {
@@ -185,10 +183,7 @@ describe('races during the recovery read', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useUploadStore.setState({ files: [] })
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      headers: { get: () => '"etag-1"' },
-    }) as never
+    installXhrFake(() => ok('"etag-1"'))
   })
 
   it('does not overwrite a cancel the user made while it was asking', async () => {
