@@ -335,16 +335,44 @@ describe('a tab that is sending', () => {
     useUploadStore.setState({ files: [] })
   })
 
-  it('stamps the row with every finished part, not only on its timer', async () => {
-    // A hidden tab's timers run about once a minute and its requests do not,
-    // so on the timer alone the stamp fell behind the transfer.
+  // A hidden tab's timers run about once a minute and its requests do not, so
+  // on the timer alone the stamp fell behind the transfer. Every finished part
+  // stamps the row too. Many parts, because progress also stamps and reports
+  // at most 96 times: with one part, a stamp per percent and a stamp per part
+  // are the same thing, and a test of one part cannot tell them apart.
+  const PARTS = 201
+  const PART = 1000
+  const SIZE = (PARTS - 1) * PART + 500
+
+  const ways: Array<[string, () => string]> = [
+    ['a new upload', () => useUploadStore.getState().startUpload(
+      new File([new Uint8Array(SIZE)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
+    )],
+    ['a new version', () => useUploadStore.getState().startVersionUpload(
+      new File([new Uint8Array(SIZE)], 'clip.mp4', { type: 'video/mp4' }), ASSET_ID, 'clip', 'project-1',
+    )],
+    ['a resume', () => {
+      useUploadStore.setState({
+        files: [row({ status: 'interrupted', fileSize: SIZE, ownerTab: undefined, heartbeatAt: undefined })],
+      })
+      vi.mocked(api.get).mockResolvedValue({
+        ...resumeInfo(null), chunk_size_bytes: PART, file_size_bytes: SIZE,
+      } as never)
+      useUploadStore.getState().resumeUpload(
+        'row-1', new File([new Uint8Array(SIZE)], 'clip.mp4', { type: 'video/mp4' }),
+      )
+      return 'row-1'
+    }],
+  ]
+
+  it.each(ways)('stamps the row with every finished part of %s, not only when the percent moves', async (_, start) => {
     let clock = 1_000_000
     const now = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000))
     vi.mocked(api.post).mockImplementation((path: string) => {
-      if (path === '/upload/initiate') {
+      if (path === '/upload/initiate' || path.endsWith('/versions')) {
         return Promise.resolve({
           upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
-          version_id: VERSION_ID, chunk_size_bytes: 10 * MB,
+          version_id: VERSION_ID, chunk_size_bytes: PART,
         }) as never
       }
       if (path === '/upload/presign-part') {
@@ -354,15 +382,19 @@ describe('a tab that is sending', () => {
     })
     installXhrFake(() => ok('"e"'))
 
-    const id = useUploadStore.getState().startUpload(
-      new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
-    )
+    const stamps = new Set<number>()
+    const unsubscribe = useUploadStore.subscribe((state) => {
+      for (const f of state.files) if (f.heartbeatAt !== undefined) stamps.add(f.heartbeatAt)
+    })
     try {
-      const claimed = rowOf(id).heartbeatAt!
-      await vi.waitFor(() => expect(rowOf(id).progress).toBeGreaterThan(0))
+      start()
+      await vi.waitFor(() =>
+        expect(api.post).toHaveBeenCalledWith('/upload/complete', expect.anything()),
+      )
 
-      expect(rowOf(id).heartbeatAt!).toBeGreaterThan(claimed)
+      expect(stamps.size).toBeGreaterThanOrEqual(PARTS)
     } finally {
+      unsubscribe()
       now.mockRestore()
     }
   })

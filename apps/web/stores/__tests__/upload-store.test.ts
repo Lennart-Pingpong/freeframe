@@ -437,6 +437,25 @@ describe('the part PUT', () => {
     expect(request!.requestHeaders).toEqual({})
   })
 
+  it('sets no timeout and sends no credentials, as the fetch call did not', async () => {
+    // A timeout would cut off a 10 MB part that is merely slow, which on the
+    // uplinks #313 is about takes minutes; fetch had none. And credentials
+    // make the browser refuse the answer from a bucket whose CORS rule allows
+    // origin `*`, which is the common way to set one up.
+    let request: FakeXhr | undefined
+    mockPut((_url, r) => {
+      request = r
+      return ok('"etag-1"')
+    })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn())
+    await vi.runAllTimersAsync()
+    await promise
+
+    expect(request!.timeout).toBe(0)
+    expect(request!.withCredentials).toBe(false)
+  })
+
   it('retries a network error, as it did a failed fetch', async () => {
     const put = mockPut()
     put
@@ -454,7 +473,7 @@ describe('the part PUT', () => {
     const put = mockPut()
     put
       .mockImplementationOnce((_url, request) => {
-        request.timeout()
+        request.expire()
         return new Promise(() => {})
       })
       .mockResolvedValueOnce(ok('"etag-1"'))

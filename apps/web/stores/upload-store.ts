@@ -276,6 +276,10 @@ function putPart(
       settle()
       reject(new TypeError(`Part ${partNumber} failed: network error`))
     }
+    // No timeout is set, as fetch had none: a 10 MB part on a slow uplink can
+    // take minutes and must not be cut off. The handler stays so that one set
+    // later, here or by a browser, fails the part retryably instead of leaving
+    // the promise unsettled, since a timeout fires neither load nor error.
     xhr.ontimeout = () => {
       settle()
       reject(new TypeError(`Part ${partNumber} failed: timed out`))
@@ -392,6 +396,11 @@ function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
  * upload — a resume must place part N at exactly the byte range the parts
  * already in the bucket were cut on, and that is not necessarily the range
  * today's CHUNK_SIZE would give.
+ *
+ * `opts.onPartDone` runs once for every part that finishes. It is the
+ * heartbeat from #312, not a progress report: `onProgress` only fires when the
+ * percent moves, and on a large file that can be many minutes apart, longer
+ * than the window another tab gives a row before it offers Discard.
  */
 export async function uploadAllParts(
   file: File,
@@ -400,7 +409,7 @@ export async function uploadAllParts(
   controller: AbortController,
   onProgress: (percent: number) => void,
   concurrency: number = UPLOAD_CONCURRENCY,
-  opts?: { chunkSize?: number; alreadyHeld?: readonly number[] },
+  opts?: { chunkSize?: number; alreadyHeld?: readonly number[]; onPartDone?: () => void },
 ): Promise<Array<{ PartNumber: number; ETag: string }>> {
   const chunkSize = opts?.chunkSize ?? CHUNK_SIZE
   const held = new Set(opts?.alreadyHeld ?? [])
@@ -471,6 +480,7 @@ export async function uploadAllParts(
         parts[index] = { PartNumber: partNumber, ETag: etag }
         inFlightBytes.delete(partNumber)
         doneBytes += partLength(partNumber)
+        opts?.onPartDone?.()
         report()
       } catch (err) {
         // Not `??=`: an error is only ever recorded once, since every worker
@@ -706,10 +716,11 @@ function isSendingHere(fileId: string, except?: AbortController): boolean {
  *  called. Written through the store, so it reaches shared storage the same way
  *  progress does.
  *
- *  Every finished part stamps the row as well. A hidden tab's timers are held
- *  to about once a minute while its requests are not, so on the timer alone
- *  the stamp fell behind the transfer, and another tab took a live upload for
- *  a stopped one before the server did. */
+ *  Every finished part stamps the row as well, through `onPartDone` rather
+ *  than progress, which only reports when the percent moves. A hidden tab's
+ *  timers are held to about once a minute while its requests are not, so on
+ *  the timer alone the stamp fell behind the transfer, and another tab took a
+ *  live upload for a stopped one before the server did. */
 function beatFor(
   update: (patch: Partial<UploadFile>) => void,
 ): () => void {
@@ -1025,7 +1036,10 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           file, s3_key, upload_id, controller,
           (percent) => updateFile(id, { progress: percent, heartbeatAt: Date.now() }),
           UPLOAD_CONCURRENCY,
-          { chunkSize: initRes.chunk_size_bytes },
+          {
+            chunkSize: initRes.chunk_size_bytes,
+            onPartDone: () => updateFile(id, { heartbeatAt: Date.now() }),
+          },
         )
 
         completionAttempted = true
@@ -1163,7 +1177,10 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           file, s3_key, upload_id, controller,
           (percent) => updateFile(id, { progress: percent, heartbeatAt: Date.now() }),
           UPLOAD_CONCURRENCY,
-          { chunkSize: initRes.chunk_size_bytes },
+          {
+            chunkSize: initRes.chunk_size_bytes,
+            onPartDone: () => updateFile(id, { heartbeatAt: Date.now() }),
+          },
         )
 
         completionAttempted = true
@@ -1304,7 +1321,11 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
             file, info.s3_key, info.upload_id, controller,
             (percent) => updateFile({ progress: percent, heartbeatAt: Date.now() }),
             UPLOAD_CONCURRENCY,
-            { chunkSize: info.chunk_size_bytes, alreadyHeld: held },
+            {
+              chunkSize: info.chunk_size_bytes,
+              alreadyHeld: held,
+              onPartDone: () => updateFile({ heartbeatAt: Date.now() }),
+            },
           )
         }
 

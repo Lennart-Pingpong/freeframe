@@ -5,8 +5,8 @@
  * and would try to reach the presigned URL. This one hands each request to a
  * handler instead, which plays the storage backend: it answers with a reply,
  * or rejects for a network error, and may report bytes on the way through
- * `request.progress()`. A handler that never settles is a part still in
- * flight, which only an abort ends.
+ * `request.progress()` or end the request with `request.expire()`. A handler
+ * that never settles is a part still in flight, which only an abort ends.
  *
  * Only what the store uses is modelled, plus one thing a browser does on its
  * own: a Blob body with a type is sent with that type as its Content-Type, so a
@@ -41,6 +41,9 @@ export class FakeXhr {
   requestHeaders: Record<string, string> = {}
   status = 0
   statusText = ''
+  /** As the code under test leaves them, or sets them. */
+  timeout = 0
+  withCredentials = false
   /** Whether the request ended by `abort()`, rather than by a reply or an error. */
   aborted = false
 
@@ -89,7 +92,8 @@ export class FakeXhr {
     this.upload.onprogress?.({ loaded, total, lengthComputable: true } as ProgressEvent)
   }
 
-  timeout(): void {
+  /** Ends the request as its timeout would. */
+  expire(): void {
     if (this.settled) return
     this.settled = true
     this.ontimeout?.()
