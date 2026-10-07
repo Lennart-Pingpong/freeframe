@@ -399,6 +399,50 @@ describe('a tab that is sending', () => {
     }
   })
 
+  it('stamps the row while the parts are going up, not only once they are done', async () => {
+    // A stamp only counts while the upload is still running: another tab reads
+    // it to decide whether to offer Discard now, and a pile of stamps written
+    // after the last part would leave the whole transfer looking stopped. So
+    // every PUT looks at the stamp as it leaves. A part only starts once one
+    // before it has finished, so the PUT one pool width later must see a newer
+    // stamp. With 2001 parts, the at most 96 stamps progress writes leave long
+    // runs of PUTs seeing the same one.
+    const PARTS = 2001
+    const POOL = 5 // UPLOAD_CONCURRENCY when the build sets none
+    let clock = 1_000_000
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000))
+    vi.mocked(api.post).mockImplementation((path: string) => {
+      if (path === '/upload/initiate') {
+        return Promise.resolve({
+          upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
+          version_id: VERSION_ID, chunk_size_bytes: 1000,
+        }) as never
+      }
+      if (path === '/upload/presign-part') {
+        return Promise.resolve({ presigned_url: 'https://s3.example/p' }) as never
+      }
+      return new Promise(() => {}) as never // completion never answers
+    })
+    let id = ''
+    const seenAtPut: number[] = []
+    installXhrFake(() => {
+      seenAtPut.push(rowOf(id).heartbeatAt!)
+      return ok('"e"')
+    })
+
+    try {
+      id = useUploadStore.getState().startUpload(
+        new File([new Uint8Array(PARTS * 1000)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
+      )
+      await vi.waitFor(() => expect(seenAtPut).toHaveLength(PARTS), { timeout: 20_000 })
+
+      const stale = seenAtPut.slice(POOL).filter((stamp, i) => stamp <= seenAtPut[i])
+      expect(stale).toHaveLength(0)
+    } finally {
+      now.mockRestore()
+    }
+  }, 30_000)
+
   it('claims the row and stamps it', async () => {
     vi.mocked(api.post).mockImplementation(() => new Promise(() => {}) as never)
 
