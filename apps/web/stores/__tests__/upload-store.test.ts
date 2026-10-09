@@ -553,6 +553,18 @@ describe('the part PUT', () => {
     expect(put.mock.calls[0][1].aborted).toBe(true)
   })
 
+  it('names an abort the browser started in its own words once every attempt has failed', async () => {
+    mockPut((_url, request) => {
+      request.abort()
+      return new Promise(() => {})
+    })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn())
+    const assertion = expect(promise).rejects.toThrow(/^Part 1 failed: aborted$/)
+    await vi.runAllTimersAsync()
+    await assertion
+  })
+
   it('reads the ETag quietly, and leaves it empty when the bucket does not expose it', async () => {
     // docs/deployment.md allows a bucket whose CORS rule does not expose the
     // ETag. getResponseHeader('ETag') logs "Refused to get unsafe header" for

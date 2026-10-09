@@ -89,8 +89,12 @@ export class FakeXhr {
     return this.etag
   }
 
+  /** Lower-cased and sorted, as a browser lists them, with ETag among others. */
   getAllResponseHeaders(): string {
-    return this.etag !== null && this.etagExposed ? `etag: ${this.etag}\r\n` : ''
+    const headers = ['content-length: 0', 'content-type: application/xml']
+    if (this.etag !== null && this.etagExposed) headers.push(`etag: ${this.etag}`)
+    headers.push('x-amz-request-id: tx0001')
+    return headers.map((line) => `${line}\r\n`).join('')
   }
 
   send(body: Blob | null): void {
