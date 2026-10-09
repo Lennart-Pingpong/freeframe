@@ -385,6 +385,43 @@ describe('uploadAllParts progress', () => {
     expect(percents(onProgress)).toEqual([43, 48, 71, 95])
   })
 
+  it('counts a short last part at its own length when it finishes first', async () => {
+    // 2100 bytes in parts of 1000: part 3 is 100 bytes. Finishing first, it is
+    // 100 of 2100 bytes, 5%; counted as a whole chunk it would claim 45%.
+    const onProgress = vi.fn()
+    const release: Array<() => void> = []
+    mockPut((url) => {
+      const part = partOf(url)
+      if (part === 3) return ok('"etag-3"')
+      return new Promise((resolve) => release.push(() => resolve(ok(`"etag-${part}"`))))
+    })
+
+    const promise = uploadAllParts(makeFile(2100), 'key', 'upload-1', controller, onProgress, 3, {
+      chunkSize: 1000,
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(percents(onProgress)).toEqual([5])
+
+    release.forEach((r) => r())
+    await vi.runAllTimersAsync()
+    await promise
+    expect(percents(onProgress)).toEqual([5, 50, 95])
+  })
+
+  it('reports nothing for a part that fails before its first progress event', async () => {
+    // The row is set to 0 before the upload starts and has just stopped when
+    // this fails. A 0 written now would also stamp a fresh heartbeat on it.
+    const onProgress = vi.fn()
+    mockPut(() => fail(403, 'Forbidden'))
+
+    const promise = uploadAllParts(makeFile(1000), 'key', 'upload-1', controller, onProgress)
+    const assertion = expect(promise).rejects.toThrow('Part 1 failed: Forbidden')
+    await vi.runAllTimersAsync()
+    await assertion
+
+    expect(onProgress).not.toHaveBeenCalled()
+  })
+
   it('never reports more than 95, whatever a progress event claims', async () => {
     // The panel prints the number as it is, so an overcount reads "Uploading 103%".
     const onProgress = vi.fn()
@@ -485,6 +522,54 @@ describe('the part PUT', () => {
     expect(put).toHaveBeenCalledTimes(2)
   })
 
+  it('names a network error in its own words once every attempt has failed', async () => {
+    // The browser's own text differs by browser ("Failed to fetch", "Load
+    // failed"); the row shows this one instead.
+    mockPut(() => Promise.reject(new Error('offline')))
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn())
+    const assertion = expect(promise).rejects.toThrow(/^Part 1 failed: network error$/)
+    await vi.runAllTimersAsync()
+    await assertion
+  })
+
+  it('retries an abort the browser started itself, which is not a cancel', async () => {
+    // window.stop(), or Stop or Esc on a pending navigation, aborts an
+    // in-flight XHR without the signal. fetch rejected with a TypeError there,
+    // and the part was retried.
+    const put = mockPut()
+    put
+      .mockImplementationOnce((_url, request) => {
+        request.abort()
+        return new Promise(() => {})
+      })
+      .mockResolvedValueOnce(ok('"etag-1"'))
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn())
+    await vi.runAllTimersAsync()
+
+    expect(await promise).toEqual([{ PartNumber: 1, ETag: '"etag-1"' }])
+    expect(put).toHaveBeenCalledTimes(2)
+    expect(put.mock.calls[0][1].aborted).toBe(true)
+  })
+
+  it('reads the ETag quietly, and leaves it empty when the bucket does not expose it', async () => {
+    // docs/deployment.md allows a bucket whose CORS rule does not expose the
+    // ETag. getResponseHeader('ETag') logs "Refused to get unsafe header" for
+    // every part there; fetch was silent.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockPut((url) => (partOf(url) === 1 ? { ...ok('"etag-1"'), exposeEtag: false } : ok('"etag-2"')))
+
+    const promise = uploadAllParts(makeFile(CHUNK_SIZE + 1000), 'key', 'upload-1', controller, vi.fn())
+    await vi.runAllTimersAsync()
+
+    expect(await promise).toEqual([
+      { PartNumber: 1, ETag: '' },
+      { PartNumber: 2, ETag: '"etag-2"' },
+    ])
+    expect(consoleError).not.toHaveBeenCalled()
+  })
+
   it('does not take a status of 0 for a 4xx', async () => {
     const put = mockPut()
     put
@@ -517,6 +602,8 @@ describe('the part PUT', () => {
     const err = await settled
     expect(err).toBeInstanceOf(DOMException)
     expect((err as DOMException).name).toBe('AbortError')
+    // The part's own error, not the fallback `uploadAllParts` makes up.
+    expect((err as DOMException).message).toBe('Part 1 cancelled')
     expect(put).not.toHaveBeenCalled()
   })
 
@@ -562,23 +649,33 @@ describe('the part PUT', () => {
       return remove.call(this, type, listener as EventListener, options as EventListenerOptions)
     })
 
-    // One part succeeds outright, one after a 503, one after a network error.
+    // One part succeeds outright, the others after a 503, a network error, a
+    // timeout and an abort the browser started itself.
     const attempts = new Map<number, number>()
-    mockPut(async (url) => {
+    mockPut(async (url, request) => {
       const part = partOf(url)
       const attempt = (attempts.get(part) ?? 0) + 1
       attempts.set(part, attempt)
-      if (part === 2 && attempt === 1) return fail(503)
-      if (part === 3 && attempt === 1) throw new Error('offline')
+      if (attempt === 1) {
+        if (part === 2) return fail(503)
+        if (part === 3) throw new Error('offline')
+        if (part === 4) {
+          request.expire()
+          return new Promise(() => {})
+        }
+        if (part === 5) {
+          request.abort()
+          return new Promise(() => {})
+        }
+      }
       return ok(`"etag-${part}"`)
     })
 
-    const promise = uploadAllParts(makeFile(2 * CHUNK_SIZE + 1000), 'key', 'upload-1', controller, vi.fn(), 3)
+    const promise = uploadAllParts(makeFile(4 * CHUNK_SIZE + 1000), 'key', 'upload-1', controller, vi.fn(), 5)
     await vi.runAllTimersAsync()
-    expect(await promise).toHaveLength(3)
+    expect(await promise).toHaveLength(5)
 
-    expect(attempts.get(2)).toBe(2)
-    expect(attempts.get(3)).toBe(2)
+    expect([2, 3, 4, 5].map((part) => attempts.get(part))).toEqual([2, 2, 2, 2])
     expect(live.size).toBe(0)
   })
 })

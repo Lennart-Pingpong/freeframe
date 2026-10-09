@@ -225,6 +225,23 @@ async function uploadPartOnce(
 }
 
 /**
+ * The ETag of a part PUT, or '' when the bucket's CORS rule does not expose it.
+ *
+ * Read from the full header list rather than with getResponseHeader('ETag'),
+ * which logs "Refused to get unsafe header" for every part when the header is
+ * not exposed. docs/deployment.md allows such a bucket, and fetch was silent.
+ */
+function etagOf(xhr: XMLHttpRequest): string {
+  for (const line of xhr.getAllResponseHeaders().split('\r\n')) {
+    const colon = line.indexOf(':')
+    if (colon > 0 && line.slice(0, colon).trim().toLowerCase() === 'etag') {
+      return line.slice(colon + 1).trim()
+    }
+  }
+  return ''
+}
+
+/**
  * PUTs one part and resolves with its ETag.
  *
  * XMLHttpRequest rather than fetch because fetch has no upload progress, and a
@@ -234,8 +251,8 @@ async function uploadPartOnce(
  *
  * - a cancel rejects with an `AbortError` DOMException, which is how
  *   `uploadPart` and `uploadAllParts` tell a cancel from a failure;
- * - a network error or timeout rejects with a plain error, which is retried,
- *   as fetch's TypeError was;
+ * - a network error, a timeout or an abort the browser started itself rejects
+ *   with a plain error, which is retried, as fetch's TypeError was;
  * - a non-2xx rejects with `permanent` set for a 4xx, so a status of 0 never
  *   counts as one;
  * - no Content-Type is set. `chunk` is a slice taken without a type, so the
@@ -265,7 +282,7 @@ function putPart(
     xhr.onload = () => {
       settle()
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(xhr.getResponseHeader('ETag') ?? '')
+        resolve(etagOf(xhr))
         return
       }
       const error: PartUploadError = new Error(`Part ${partNumber} failed: ${xhr.statusText}`)
@@ -284,9 +301,18 @@ function putPart(
       settle()
       reject(new TypeError(`Part ${partNumber} failed: timed out`))
     }
+    // Not every abort is a cancel. A browser aborts an in-flight XHR on its
+    // own, on window.stop() or when Stop or Esc cancels a pending navigation,
+    // where fetch rejected with a TypeError and the part was retried. Only an
+    // abort of the signal may come out as an AbortError: the caller takes that
+    // for a user cancel and discards every part the backend holds.
     xhr.onabort = () => {
       settle()
-      reject(new DOMException(`Part ${partNumber} cancelled`, 'AbortError'))
+      reject(
+        signal.aborted
+          ? new DOMException(`Part ${partNumber} cancelled`, 'AbortError')
+          : new TypeError(`Part ${partNumber} failed: aborted`),
+      )
     }
 
     xhr.open('PUT', url)
@@ -447,7 +473,10 @@ export async function uploadAllParts(
   // bar waits at its mark until the retry has caught up, rather than jumping
   // back. And it never passes 95, which the panel would print as it is.
   const inFlightBytes = new Map<number, number>()
-  let reported = -1
+  // Every caller sets the row to 0 before this starts, so 0 is never reported
+  // again: a part that fails before its first progress event would otherwise
+  // write a 0 into a row that has just stopped, and stamp its heartbeat.
+  let reported = 0
   const report = () => {
     let sent = doneBytes
     inFlightBytes.forEach((bytes) => {
