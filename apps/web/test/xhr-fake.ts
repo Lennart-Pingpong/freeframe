@@ -8,9 +8,23 @@
  * `request.progress()` or end the request with `request.expire()`. A handler
  * that never settles is a part still in flight, which only an abort ends.
  *
- * Only what the store uses is modelled, plus one thing a browser does on its
- * own: a Blob body with a type is sent with that type as its Content-Type, so a
- * test can see a header the code never set itself.
+ * Only what the store uses is modelled, plus what a browser does on its own
+ * where the store could get it wrong unnoticed:
+ *
+ * - a Blob body with a type is sent with that type as its Content-Type, so a
+ *   test can see a header the code never set itself;
+ * - whether there is an upload listener is decided at `send()`, the spec's
+ *   upload listener flag. A handler assigned later gets no progress events in
+ *   Chrome or WebKit, and gets none here either;
+ * - `send()` before `open()` throws an InvalidStateError;
+ * - a reply can leave its ETag unexposed, as a bucket whose CORS rule does not
+ *   list it does. `getAllResponseHeaders()` then leaves it out, and
+ *   `getResponseHeader('ETag')` logs the browser's "Refused to get unsafe
+ *   header" to the console.
+ *
+ * A handler may also call `request.abort()` itself. That is an abort the
+ * browser starts on its own, on window.stop() or a cancelled navigation,
+ * without the store's signal.
  */
 import { vi } from 'vitest'
 
@@ -18,6 +32,8 @@ export interface PartReply {
   status: number
   statusText?: string
   etag?: string
+  /** False for a bucket whose CORS rule does not expose the ETag. */
+  exposeEtag?: boolean
 }
 
 export type PartHandler = (url: string, request: FakeXhr) => PartReply | Promise<PartReply>
@@ -47,13 +63,17 @@ export class FakeXhr {
   /** Whether the request ended by `abort()`, rather than by a reply or an error. */
   aborted = false
 
+  private opened = false
   private sent = false
   private settled = false
+  private uploadListener = false
   private etag: string | null = null
+  private etagExposed = true
 
   open(method: string, url: string): void {
     this.method = method
     this.url = url
+    this.opened = true
   }
 
   setRequestHeader(name: string, value: string): void {
@@ -61,10 +81,23 @@ export class FakeXhr {
   }
 
   getResponseHeader(name: string): string | null {
-    return name.toLowerCase() === 'etag' ? this.etag : null
+    if (name.toLowerCase() !== 'etag') return null
+    if (!this.etagExposed) {
+      console.error(`Refused to get unsafe header "${name}"`)
+      return null
+    }
+    return this.etag
+  }
+
+  getAllResponseHeaders(): string {
+    return this.etag !== null && this.etagExposed ? `etag: ${this.etag}\r\n` : ''
   }
 
   send(body: Blob | null): void {
+    if (!this.opened || this.sent) {
+      throw new DOMException("Failed to execute 'send': the object's state must be OPENED.", 'InvalidStateError')
+    }
+    this.uploadListener = this.upload.onprogress !== null
     this.body = body
     this.sent = true
     if (body instanceof Blob && body.type && !('content-type' in this.requestHeaders)) {
@@ -85,9 +118,12 @@ export class FakeXhr {
     this.onabort?.()
   }
 
-  /** Reports `loaded` bytes of the body as sent. */
+  /**
+   * Reports `loaded` bytes of the body as sent, to an upload listener that was
+   * there at `send()`. One assigned later hears nothing, as in a browser.
+   */
   progress(loaded: number): void {
-    if (this.settled) return
+    if (this.settled || !this.uploadListener) return
     const total = this.body?.size ?? 0
     this.upload.onprogress?.({ loaded, total, lengthComputable: true } as ProgressEvent)
   }
@@ -99,12 +135,13 @@ export class FakeXhr {
     this.ontimeout?.()
   }
 
-  private reply({ status, statusText = '', etag }: PartReply): void {
+  private reply({ status, statusText = '', etag, exposeEtag = true }: PartReply): void {
     if (this.settled) return
     this.settled = true
     this.status = status
     this.statusText = statusText
     this.etag = etag ?? null
+    this.etagExposed = exposeEtag
     this.onload?.()
   }
 
